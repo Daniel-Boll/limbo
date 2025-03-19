@@ -363,7 +363,6 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all)]
     pub fn step(
         &self,
         state: &mut ProgramState,
