@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"runtime"
+	"time"
 	"unsafe"
 )
 
@@ -75,12 +76,14 @@ const (
 	FfiStmtExec           = "stmt_execute"
 	FfiStmtQuery          = "stmt_query"
 	FfiStmtParameterCount = "stmt_parameter_count"
+	FfiStmtGetError       = "stmt_get_error"
 	FfiStmtClose          = "stmt_close"
 	FfiRowsClose          = "rows_close"
 	FfiRowsGetColumns     = "rows_get_columns"
 	FfiRowsGetColumnName  = "rows_get_column_name"
 	FfiRowsNext           = "rows_next"
 	FfiRowsGetValue       = "rows_get_value"
+	FfiRowsGetError       = "rows_get_error"
 	FfiFreeColumns        = "free_columns"
 	FfiFreeCString        = "free_string"
 	FfiFreeBlob           = "free_blob"
@@ -154,7 +157,15 @@ func toGoValue(valPtr uintptr) interface{} {
 	case textVal:
 		textPtr := *(*uintptr)(unsafe.Pointer(&val.Value))
 		defer freeCString(textPtr)
-		return GoString(textPtr)
+		str := GoString(textPtr)
+
+		// Try to parse as RFC3339 time format
+		if t, err := time.Parse(time.RFC3339, str); err == nil {
+			return t
+		}
+
+		// If it doesn't parse as time, return as string
+		return str
 	case blobVal:
 		blobPtr := *(*uintptr)(unsafe.Pointer(&val.Value))
 		defer freeBlob(blobPtr)
@@ -234,6 +245,13 @@ func buildArgs(args []driver.Value) ([]limboValue, func(), error) {
 		case float64:
 			limboVal.Type = realVal
 			limboVal.Value = *(*[8]byte)(unsafe.Pointer(&val))
+		case bool:
+			limboVal.Type = intVal
+			boolAsInt := int64(0)
+			if val {
+				boolAsInt = 1
+			}
+			limboVal.Value = *(*[8]byte)(unsafe.Pointer(&boolAsInt))
 		case string:
 			limboVal.Type = textVal
 			cstr := CString(val)
@@ -244,6 +262,12 @@ func buildArgs(args []driver.Value) ([]limboValue, func(), error) {
 			blob := makeBlob(val)
 			pinner.Pin(blob)
 			*(*uintptr)(unsafe.Pointer(&limboVal.Value)) = uintptr(unsafe.Pointer(blob))
+		case time.Time:
+			limboVal.Type = textVal
+			timeStr := val.Format(time.RFC3339)
+			cstr := CString(timeStr)
+			pinner.Pin(cstr)
+			*(*uintptr)(unsafe.Pointer(&limboVal.Value)) = uintptr(unsafe.Pointer(cstr))
 		default:
 			return nil, pinner.Unpin, fmt.Errorf("unsupported type: %T", v)
 		}

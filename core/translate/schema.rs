@@ -1,7 +1,13 @@
+use std::collections::HashSet;
 use std::fmt::Display;
+use std::ops::Range;
+use std::rc::Rc;
 
 use crate::ast;
+use crate::ext::VTabImpl;
 use crate::schema::Schema;
+use crate::schema::Table;
+use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::translate::QueryMode;
@@ -9,9 +15,17 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{CmpInsFlags, Insn};
 use crate::LimboError;
+use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
 
+use limbo_ext::VTabKind;
 use limbo_sqlite3_parser::ast::{fmt::ToTokens, CreateVirtualTable};
+
+#[derive(Debug, Clone, Copy)]
+pub enum ParseSchema {
+    None,
+    Reload,
+}
 
 pub fn translate_create_table(
     query_mode: QueryMode,
@@ -35,7 +49,7 @@ pub fn translate_create_table(
             let init_label = program.emit_init();
             let start_offset = program.offset();
             program.emit_halt();
-            program.resolve_label(init_label, program.offset());
+            program.preassign_label_to_next_insn(init_label);
             program.emit_transaction(true);
             program.emit_constant_insns();
             program.emit_goto(start_offset);
@@ -60,7 +74,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: table_root_reg,
-        flags: 1, // Table leaf page
+        flags: CreateBTreeFlags::new_table(),
     });
 
     // Create an automatic index B-tree if needed
@@ -87,13 +101,15 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_root_reg = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
-    if let Some(index_root_reg) = index_root_reg {
-        program.emit_insn(Insn::CreateBtree {
-            db: 0,
-            root: index_root_reg,
-            flags: 2, // Index leaf page
-        });
+    let index_regs = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
+    if let Some(index_regs) = index_regs.as_ref() {
+        for index_reg in index_regs.clone() {
+            program.emit_insn(Insn::CreateBtree {
+                db: 0,
+                root: index_reg,
+                flags: CreateBTreeFlags::new_index(),
+            });
+        }
     }
 
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
@@ -101,11 +117,11 @@ pub fn translate_create_table(
         Some(SQLITE_TABLEID.to_owned()),
         CursorType::BTreeTable(table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
+        name: tbl_name.name.0.clone(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     // Add the table entry to sqlite_schema
     emit_schema_entry(
@@ -119,20 +135,24 @@ pub fn translate_create_table(
     );
 
     // If we need an automatic index, add its entry to sqlite_schema
-    if let Some(index_root_reg) = index_root_reg {
-        let index_name = format!(
-            "{}{}_1",
-            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, tbl_name.name.0
-        );
-        emit_schema_entry(
-            &mut program,
-            sqlite_schema_cursor_id,
-            SchemaEntryType::Index,
-            &index_name,
-            &tbl_name.name.0,
-            index_root_reg,
-            None,
-        );
+    if let Some(index_regs) = index_regs {
+        for (idx, index_reg) in index_regs.into_iter().enumerate() {
+            let index_name = format!(
+                "{}{}_{}",
+                PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+                tbl_name.name.0,
+                idx + 1
+            );
+            emit_schema_entry(
+                &mut program,
+                sqlite_schema_cursor_id,
+                SchemaEntryType::Index,
+                &index_name,
+                &tbl_name.name.0,
+                index_reg,
+                None,
+            );
+        }
     }
 
     program.resolve_label(parse_schema_label, program.offset());
@@ -142,12 +162,12 @@ pub fn translate_create_table(
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: parse_schema_where_clause,
+        where_clause: Some(parse_schema_where_clause),
     });
 
     // TODO: SqlExec
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
@@ -217,19 +237,19 @@ pub fn emit_schema_entry(
         start_reg: type_reg,
         count: 5,
         dest_reg: record_reg,
+        index_name: None,
     });
 
-    program.emit_insn(Insn::InsertAsync {
+    program.emit_insn(Insn::Insert {
         cursor: sqlite_schema_cursor_id,
         key_reg: rowid_reg,
         record_reg,
         flag: 0,
-    });
-    program.emit_insn(Insn::InsertAwait {
-        cursor_id: sqlite_schema_cursor_id,
+        table_name: tbl_name.to_string(),
     });
 }
 
+#[derive(Debug)]
 struct PrimaryKeyColumnInfo<'a> {
     name: &'a String,
     is_descending: bool,
@@ -248,7 +268,7 @@ fn check_automatic_pk_index_required(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
     tbl_name: &str,
-) -> Result<Option<usize>> {
+) -> Result<Option<Range<usize>>> {
     match body {
         ast::CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -256,6 +276,8 @@ fn check_automatic_pk_index_required(
             options,
         } => {
             let mut primary_key_definition = None;
+            // Used to dedup named unique constraints
+            let mut unique_sets = vec![];
 
             // Check table constraints for PRIMARY KEY
             if let Some(constraints) = constraints {
@@ -264,55 +286,92 @@ fn check_automatic_pk_index_required(
                         columns: pk_cols, ..
                     } = &constraint.constraint
                     {
-                        let primary_key_column_results: Vec<Result<PrimaryKeyColumnInfo>> = pk_cols
+                        if primary_key_definition.is_some() {
+                            bail_parse_error!("table {} has more than one primary key", tbl_name);
+                        }
+                        let primary_key_column_results = pk_cols
                             .iter()
                             .map(|col| match &col.expr {
-                                ast::Expr::Id(name) => Ok(PrimaryKeyColumnInfo {
-                                    name: &name.0,
-                                    is_descending: matches!(col.order, Some(ast::SortOrder::Desc)),
-                                }),
+                                ast::Expr::Id(name) => {
+                                    if !columns.iter().any(|(k, _)| k.0 == name.0) {
+                                        bail_parse_error!("No such column: {}", name.0);
+                                    }
+                                    Ok(PrimaryKeyColumnInfo {
+                                        name: &name.0,
+                                        is_descending: matches!(
+                                            col.order,
+                                            Some(ast::SortOrder::Desc)
+                                        ),
+                                    })
+                                }
                                 _ => Err(LimboError::ParseError(
                                     "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
                                         .to_string(),
                                 )),
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
 
-                        for result in primary_key_column_results {
-                            if let Err(e) = result {
-                                bail_parse_error!("{}", e);
-                            }
-                            let pk_info = result?;
-
+                        for pk_info in primary_key_column_results {
                             let column_name = pk_info.name;
-                            let column_def = columns.get(&ast::Name(column_name.clone()));
-                            if column_def.is_none() {
-                                bail_parse_error!("No such column: {}", column_name);
-                            }
+                            let (_, column_def) = columns
+                                .iter()
+                                .find(|(k, _)| k.0 == *column_name)
+                                .expect("primary key column should be in Create Body columns");
 
-                            if matches!(
-                                primary_key_definition,
-                                Some(PrimaryKeyDefinitionType::Simple { .. })
-                            ) {
-                                primary_key_definition = Some(PrimaryKeyDefinitionType::Composite);
-                                continue;
-                            }
-                            if primary_key_definition.is_none() {
-                                let column_def = column_def.unwrap();
-                                let typename =
-                                    column_def.col_type.as_ref().map(|t| t.name.as_str());
-                                let is_descending = pk_info.is_descending;
-                                primary_key_definition = Some(PrimaryKeyDefinitionType::Simple {
-                                    typename,
-                                    is_descending,
-                                });
+                            match &mut primary_key_definition {
+                                Some(PrimaryKeyDefinitionType::Simple { column, .. }) => {
+                                    let mut columns = HashSet::new();
+                                    columns.insert(std::mem::take(column));
+                                    // Have to also insert the current column_name we are iterating over in primary_key_column_results
+                                    columns.insert(column_name.clone());
+                                    primary_key_definition =
+                                        Some(PrimaryKeyDefinitionType::Composite { columns });
+                                }
+                                Some(PrimaryKeyDefinitionType::Composite { columns }) => {
+                                    columns.insert(column_name.clone());
+                                }
+                                None => {
+                                    let typename =
+                                        column_def.col_type.as_ref().map(|t| t.name.as_str());
+                                    let is_descending = pk_info.is_descending;
+                                    primary_key_definition =
+                                        Some(PrimaryKeyDefinitionType::Simple {
+                                            typename,
+                                            is_descending,
+                                            column: column_name.clone(),
+                                        });
+                                }
                             }
                         }
+                    } else if let ast::TableConstraint::Unique {
+                        columns: unique_columns,
+                        conflict_clause,
+                    } = &constraint.constraint
+                    {
+                        if conflict_clause.is_some() {
+                            unimplemented!("ON CONFLICT not implemented");
+                        }
+
+                        let col_names = unique_columns
+                            .iter()
+                            .map(|column| match &column.expr {
+                                limbo_sqlite3_parser::ast::Expr::Id(id) => {
+                                    if !columns.iter().any(|(k, _)| k.0 == id.0) {
+                                        bail_parse_error!("No such column: {}", id.0);
+                                    }
+                                    Ok(crate::util::normalize_ident(&id.0))
+                                }
+                                _ => {
+                                    todo!("Unsupported unique expression");
+                                }
+                            })
+                            .collect::<Result<HashSet<String>>>()?;
+                        unique_sets.push(col_names);
                     }
                 }
             }
 
-            // Check column constraints for PRIMARY KEY
+            // Check column constraints for PRIMARY KEY and UNIQUE
             for (_, col_def) in columns.iter() {
                 for constraint in &col_def.constraints {
                     if matches!(
@@ -326,7 +385,12 @@ fn check_automatic_pk_index_required(
                         primary_key_definition = Some(PrimaryKeyDefinitionType::Simple {
                             typename,
                             is_descending: false,
+                            column: col_def.col_name.0.clone(),
                         });
+                    } else if matches!(constraint.constraint, ast::ColumnConstraint::Unique(..)) {
+                        let mut single_set = HashSet::new();
+                        single_set.insert(col_def.col_name.0.clone());
+                        unique_sets.push(single_set);
                     }
                 }
             }
@@ -336,26 +400,41 @@ fn check_automatic_pk_index_required(
                 bail_parse_error!("WITHOUT ROWID tables are not supported yet");
             }
 
+            unique_sets.dedup();
+
             // Check if we need an automatic index
-            let needs_auto_index = if let Some(primary_key_definition) = &primary_key_definition {
+            let mut pk_is_unique = false;
+            let auto_index_pk = if let Some(primary_key_definition) = &primary_key_definition {
                 match primary_key_definition {
                     PrimaryKeyDefinitionType::Simple {
                         typename,
                         is_descending,
+                        column,
                     } => {
+                        pk_is_unique = unique_sets
+                            .iter()
+                            .any(|set| set.len() == 1 && set.contains(column));
                         let is_integer =
-                            typename.is_some() && typename.unwrap().to_uppercase() == "INTEGER";
+                            typename.is_some() && typename.unwrap().eq_ignore_ascii_case("INTEGER"); // Should match on any case of INTEGER
                         !is_integer || *is_descending
                     }
-                    PrimaryKeyDefinitionType::Composite => true,
+                    PrimaryKeyDefinitionType::Composite { columns } => {
+                        pk_is_unique = unique_sets.iter().any(|set| set == columns);
+                        true
+                    }
                 }
             } else {
                 false
             };
+            let mut total_indices = unique_sets.len();
+            // if pk needs and index, but we already found out we primary key is unique, we only need a single index since constraint pk == unique
+            if auto_index_pk && !pk_is_unique {
+                total_indices += 1;
+            }
 
-            if needs_auto_index {
-                let index_root_reg = program.alloc_register();
-                Ok(Some(index_root_reg))
+            if total_indices > 0 {
+                let index_start_reg = program.alloc_registers(total_indices);
+                Ok(Some(index_start_reg..index_start_reg + total_indices))
             } else {
                 Ok(None)
             }
@@ -366,17 +445,22 @@ fn check_automatic_pk_index_required(
     }
 }
 
+#[derive(Debug)]
 enum PrimaryKeyDefinitionType<'a> {
     Simple {
+        column: String,
         typename: Option<&'a str>,
         is_descending: bool,
     },
-    Composite,
+    Composite {
+        columns: HashSet<String>,
+    },
 }
 
 struct TableFormatter<'a> {
     body: &'a ast::CreateTableBody,
 }
+
 impl Display for TableFormatter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.body.to_fmt(f)
@@ -398,7 +482,7 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
     sql
 }
 
-fn create_vtable_body_to_str(vtab: &CreateVirtualTable) -> String {
+fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) -> String {
     let args = if let Some(args) = &vtab.args {
         args.iter()
             .map(|arg| arg.to_string())
@@ -412,8 +496,25 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable) -> String {
     } else {
         ""
     };
+    let ext_args = vtab
+        .args
+        .as_ref()
+        .unwrap_or(&vec![])
+        .iter()
+        .map(|a| limbo_ext::Value::from_text(a.to_string()))
+        .collect::<Vec<_>>();
+    let schema = module
+        .implementation
+        .init_schema(ext_args)
+        .unwrap_or_default();
+    let vtab_args = if let Some(first_paren) = schema.find('(') {
+        let closing_paren = schema.rfind(')').unwrap_or_default();
+        &schema[first_paren..=closing_paren]
+    } else {
+        "()"
+    };
     format!(
-        "CREATE VIRTUAL TABLE {} {} USING {}{}",
+        "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
         vtab.tbl_name.name.0,
         if_not_exists,
         vtab.module_name.0,
@@ -421,7 +522,9 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable) -> String {
             String::new()
         } else {
             format!("({})", args)
-        }
+        },
+        vtab.tbl_name.name.0,
+        vtab_args
     )
 }
 
@@ -429,6 +532,7 @@ pub fn translate_create_virtual_table(
     vtab: CreateVirtualTable,
     schema: &Schema,
     query_mode: QueryMode,
+    syms: &SymbolTable,
 ) -> Result<ProgramBuilder> {
     let ast::CreateVirtualTable {
         if_not_exists,
@@ -440,20 +544,30 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.0.clone();
     let module_name_str = module_name.0.clone();
     let args_vec = args.clone().unwrap_or_default();
-
-    if schema.get_table(&table_name).is_some() && *if_not_exists {
-        let mut program = ProgramBuilder::new(ProgramBuilderOpts {
-            query_mode,
-            num_cursors: 1,
-            approx_num_insns: 5,
-            approx_num_labels: 1,
-        });
-        let init_label = program.emit_init();
-        program.emit_halt();
-        program.resolve_label(init_label, program.offset());
-        program.emit_transaction(true);
-        program.emit_constant_insns();
-        return Ok(program);
+    let Some(vtab_module) = syms.vtab_modules.get(&module_name_str) else {
+        bail_parse_error!("no such module: {}", module_name_str);
+    };
+    if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
+        bail_parse_error!("module {} is not a virtual table", module_name_str);
+    };
+    if schema.get_table(&table_name).is_some() {
+        if *if_not_exists {
+            let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+                query_mode,
+                num_cursors: 1,
+                approx_num_insns: 5,
+                approx_num_labels: 1,
+            });
+            let init_label = program.emit_init();
+            let start_offset = program.offset();
+            program.emit_halt();
+            program.preassign_label_to_next_insn(init_label);
+            program.emit_transaction(true);
+            program.emit_constant_insns();
+            program.emit_goto(start_offset);
+            return Ok(program);
+        }
+        bail_parse_error!("Table {} already exists", tbl_name);
     }
 
     let mut program = ProgramBuilder::new(ProgramBuilderOpts {
@@ -466,7 +580,6 @@ pub fn translate_create_virtual_table(
     let start_offset = program.offset();
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
-
     let args_reg = if !args_vec.is_empty() {
         let args_start = program.alloc_register();
 
@@ -481,6 +594,7 @@ pub fn translate_create_virtual_table(
             start_reg: args_start,
             count: args_vec.len(),
             dest_reg: args_record_reg,
+            index_name: None,
         });
         Some(args_record_reg)
     } else {
@@ -492,19 +606,18 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
         Some(SQLITE_TABLEID.to_owned()),
         CursorType::BTreeTable(table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
+        name: table_name.clone(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
-    let sql = create_vtable_body_to_str(&vtab);
+    let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         &mut program,
         sqlite_schema_cursor_id,
@@ -518,11 +631,11 @@ pub fn translate_create_virtual_table(
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: parse_schema_where_clause,
+        where_clause: Some(parse_schema_where_clause),
     });
 
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
@@ -542,13 +655,13 @@ pub fn translate_drop_table(
         approx_num_insns: 30,
         approx_num_labels: 1,
     });
-    let table = schema.get_btree_table(tbl_name.name.0.as_str());
+    let table = schema.get_table(tbl_name.name.0.as_str());
     if table.is_none() {
         if if_exists {
             let init_label = program.emit_init();
             let start_offset = program.offset();
             program.emit_halt();
-            program.resolve_label(init_label, program.offset());
+            program.preassign_label_to_next_insn(init_label);
             program.emit_transaction(true);
             program.emit_constant_insns();
             program.emit_goto(start_offset);
@@ -557,6 +670,7 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {}", tbl_name.name.0.as_str());
     }
+
     let table = table.unwrap(); // safe since we just checked for None
 
     let init_label = program.emit_init();
@@ -577,26 +691,23 @@ pub fn translate_drop_table(
         Some(table_name.to_string()),
         CursorType::BTreeTable(schema_table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
+        name: tbl_name.name.0.clone(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     //  1. Remove all entries from the schema table related to the table we are dropping, except for triggers
     //  loop to beginning of schema table
-    program.emit_insn(Insn::RewindAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
     let end_metadata_label = program.allocate_label();
-    program.emit_insn(Insn::RewindAwait {
+    let metadata_loop = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: end_metadata_label,
     });
+    program.preassign_label_to_next_insn(metadata_loop);
 
     //  start loop on schema table
-    let metadata_loop = program.allocate_label();
-    program.resolve_label(metadata_loop, program.offset());
     program.emit_insn(Insn::Column {
         cursor_id: sqlite_schema_cursor_id,
         column: 2,
@@ -608,6 +719,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
     });
     program.emit_insn(Insn::Column {
         cursor_id: sqlite_schema_cursor_id,
@@ -619,27 +731,22 @@ pub fn translate_drop_table(
         rhs: table_type,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: row_id_reg,
     });
-    program.emit_insn(Insn::DeleteAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
-    program.emit_insn(Insn::DeleteAwait {
+    program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
     });
 
     program.resolve_label(next_label, program.offset());
-    program.emit_insn(Insn::NextAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
-    program.emit_insn(Insn::NextAwait {
+    program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: metadata_loop,
     });
-    program.resolve_label(end_metadata_label, program.offset());
+    program.preassign_label_to_next_insn(end_metadata_label);
     //  end of loop on schema table
 
     //  2. Destroy the indices within a loop
@@ -662,11 +769,32 @@ pub fn translate_drop_table(
     }
 
     //  3. Destroy the table structure
-    program.emit_insn(Insn::Destroy {
-        root: table.root_page,
-        former_root_reg: 0, //  no autovacuum (https://www.sqlite.org/opcode.html#Destroy)
-        is_temp: 0,
-    });
+    match table.as_ref() {
+        Table::BTree(table) => {
+            program.emit_insn(Insn::Destroy {
+                root: table.root_page,
+                former_root_reg: 0, //  no autovacuum (https://www.sqlite.org/opcode.html#Destroy)
+                is_temp: 0,
+            });
+        }
+        Table::Virtual(vtab) => {
+            // From what I see, TableValuedFunction is not stored in the schema as a table.
+            // But this line here below is a safeguard in case this behavior changes in the future
+            // And mirrors what SQLite does.
+            if matches!(vtab.kind, limbo_ext::VTabKind::TableValuedFunction) {
+                return Err(crate::LimboError::ParseError(format!(
+                    "table {} may not be dropped",
+                    vtab.name
+                )));
+            }
+            program.emit_insn(Insn::VDestroy {
+                table_name: vtab.name.clone(),
+                db: 0, // TODO change this for multiple databases
+            });
+        }
+        Table::Pseudo(..) => unimplemented!(),
+        Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
+    };
 
     let r6 = program.alloc_register();
     let r7 = program.alloc_register();
@@ -688,7 +816,7 @@ pub fn translate_drop_table(
 
     //  end of the program
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
 

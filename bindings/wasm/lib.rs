@@ -1,7 +1,5 @@
 use js_sys::{Array, Object};
-use limbo_core::{
-    maybe_init_database_file, Clock, Instant, OpenFlags, Pager, Result, WalFileShared,
-};
+use limbo_core::{maybe_init_database_file, Clock, Instant, OpenFlags, Result};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,22 +17,10 @@ impl Database {
     #[wasm_bindgen(constructor)]
     pub fn new(path: &str) -> Database {
         let io: Arc<dyn limbo_core::IO> = Arc::new(PlatformIO { vfs: VFS::new() });
-        let file = io
-            .open_file(path, limbo_core::OpenFlags::Create, false)
-            .unwrap();
+        let file = io.open_file(path, OpenFlags::Create, false).unwrap();
         maybe_init_database_file(&file, &io).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db_header = Pager::begin_open(db_file.clone()).unwrap();
-
-        // ensure db header is there
-        io.run_once().unwrap();
-
-        let page_size = db_header.lock().page_size;
-
-        let wal_path = format!("{}-wal", path);
-        let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
-
-        let db = limbo_core::Database::open(io, db_file, wal_shared, false).unwrap();
+        let db = limbo_core::Database::open(io, path, db_file, false).unwrap();
         let conn = db.connect().unwrap();
         Database { db, conn }
     }
@@ -179,10 +165,10 @@ impl Statement {
     }
 }
 
-fn to_js_value(value: &limbo_core::OwnedValue) -> JsValue {
+fn to_js_value(value: &limbo_core::Value) -> JsValue {
     match value {
-        limbo_core::OwnedValue::Null => JsValue::null(),
-        limbo_core::OwnedValue::Integer(i) => {
+        limbo_core::Value::Null => JsValue::null(),
+        limbo_core::Value::Integer(i) => {
             let i = *i;
             if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                 JsValue::from(i as i32)
@@ -190,9 +176,9 @@ fn to_js_value(value: &limbo_core::OwnedValue) -> JsValue {
                 JsValue::from(i)
             }
         }
-        limbo_core::OwnedValue::Float(f) => JsValue::from(*f),
-        limbo_core::OwnedValue::Text(t) => JsValue::from_str(t.as_str()),
-        limbo_core::OwnedValue::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+        limbo_core::Value::Float(f) => JsValue::from(*f),
+        limbo_core::Value::Text(t) => JsValue::from_str(t.as_str()),
+        limbo_core::Value::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
     }
 }
 
@@ -304,6 +290,10 @@ impl limbo_core::IO for PlatformIO {
     fn generate_random_number(&self) -> i64 {
         let random_f64 = Math_random();
         (random_f64 * i64::MAX as f64) as i64
+    }
+
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
+        Arc::new(limbo_core::MemoryIO::new())
     }
 }
 

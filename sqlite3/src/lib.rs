@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
-use limbo_core::OwnedValue;
+use limbo_core::Value;
 use log::trace;
 use std::ffi::{self, CStr, CString};
 
@@ -40,6 +40,7 @@ pub mod util;
 use util::sqlite3_safety_check_sick_or_ok;
 
 pub struct sqlite3 {
+    pub(crate) io: Arc<dyn limbo_core::IO>,
     pub(crate) _db: Arc<limbo_core::Database>,
     pub(crate) conn: Rc<limbo_core::Connection>,
     pub(crate) err_code: ffi::c_int,
@@ -50,8 +51,13 @@ pub struct sqlite3 {
 }
 
 impl sqlite3 {
-    pub fn new(db: Arc<limbo_core::Database>, conn: Rc<limbo_core::Connection>) -> Self {
+    pub fn new(
+        io: Arc<dyn limbo_core::IO>,
+        db: Arc<limbo_core::Database>,
+        conn: Rc<limbo_core::Connection>,
+    ) -> Self {
         Self {
+            io,
             _db: db,
             conn,
             err_code: SQLITE_OK,
@@ -64,12 +70,13 @@ impl sqlite3 {
 }
 
 pub struct sqlite3_stmt {
+    pub(crate) db: *mut sqlite3,
     pub(crate) stmt: limbo_core::Statement,
 }
 
 impl sqlite3_stmt {
-    pub fn new(stmt: limbo_core::Statement) -> Self {
-        Self { stmt }
+    pub fn new(db: *mut sqlite3, stmt: limbo_core::Statement) -> Self {
+        Self { db, stmt }
     }
 }
 
@@ -117,14 +124,14 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match limbo_core::Database::open_file(io, filename, false) {
+    match limbo_core::Database::open_file(io.clone(), filename, false) {
         Ok(db) => {
             let conn = db.connect().unwrap();
-            *db_out = Box::leak(Box::new(sqlite3::new(db, conn)));
+            *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn)));
             SQLITE_OK
         }
         Err(e) => {
-            log::error!("error opening database {:?}", e);
+            log::trace!("error opening database {}: {:?}", filename, e);
             SQLITE_CANTOPEN
         }
     }
@@ -219,7 +226,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         Ok(stmt) => stmt,
         Err(_) => return SQLITE_ERROR,
     };
-    *out_stmt = Box::leak(Box::new(sqlite3_stmt::new(stmt)));
+    *out_stmt = Box::leak(Box::new(sqlite3_stmt::new(db, stmt)));
     SQLITE_OK
 }
 
@@ -235,16 +242,23 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
-    if let Ok(result) = stmt.stmt.step() {
-        match result {
-            limbo_core::StepResult::IO => SQLITE_BUSY,
-            limbo_core::StepResult::Done => SQLITE_DONE,
-            limbo_core::StepResult::Interrupt => SQLITE_INTERRUPT,
-            limbo_core::StepResult::Row => SQLITE_ROW,
-            limbo_core::StepResult::Busy => SQLITE_BUSY,
+    let db = &mut *stmt.db;
+    loop {
+        if let Ok(result) = stmt.stmt.step() {
+            match result {
+                limbo_core::StepResult::IO => {
+                    let io = db.io.clone();
+                    io.run_once().unwrap();
+                    continue;
+                }
+                limbo_core::StepResult::Done => return SQLITE_DONE,
+                limbo_core::StepResult::Interrupt => return SQLITE_INTERRUPT,
+                limbo_core::StepResult::Row => return SQLITE_ROW,
+                limbo_core::StepResult::Busy => return SQLITE_BUSY,
+            }
+        } else {
+            return SQLITE_ERROR;
         }
-    } else {
-        SQLITE_ERROR
     }
 }
 
@@ -565,63 +579,63 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_int {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Null => 0,
-        limbo_core::OwnedValue::Integer(_) => 1,
-        limbo_core::OwnedValue::Float(_) => 2,
-        limbo_core::OwnedValue::Text(_) => 3,
-        limbo_core::OwnedValue::Blob(_) => 4,
+        limbo_core::Value::Null => 0,
+        limbo_core::Value::Integer(_) => 1,
+        limbo_core::Value::Float(_) => 2,
+        limbo_core::Value::Text(_) => 3,
+        limbo_core::Value::Blob(_) => 4,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Integer(i) => *i,
+        limbo_core::Value::Integer(i) => *i,
         _ => 0,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Float(f) => *f,
+        limbo_core::Value::Float(f) => *f,
         _ => 0.0,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const ffi::c_uchar {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Text(text) => text.as_str().as_ptr(),
+        limbo_core::Value::Text(text) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
+        limbo_core::Value::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
         _ => std::ptr::null(),
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_int {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Blob(blob) => blob.len() as ffi::c_int,
+        limbo_core::Value::Blob(blob) => blob.len() as ffi::c_int,
         _ => 0,
     }
 }
@@ -637,8 +651,8 @@ pub unsafe extern "C" fn sqlite3_column_text(
         Some(row) => row,
         None => return std::ptr::null(),
     };
-    match row.get::<&OwnedValue>(idx as usize) {
-        Ok(limbo_core::OwnedValue::Text(text)) => text.as_str().as_ptr(),
+    match row.get::<&Value>(idx as usize) {
+        Ok(limbo_core::Value::Text(text)) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }
@@ -1084,186 +1098,37 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     SQLITE_OK
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ptr;
-
-    #[test]
-    fn test_libversion() {
-        unsafe {
-            let version = sqlite3_libversion();
-            assert!(!version.is_null());
-        }
+/// Get the number of frames in the WAL.
+///
+/// The `libsql_wal_frame_count` function returns the number of frames
+/// in the WAL in the `p_frame_count` parameter.
+///
+/// # Returns
+///
+/// - `SQLITE_OK` if the number of frames in the WAL file is
+///   successfully returned.
+/// - `SQLITE_MISUSE` if the `db` is `NULL`.
+/// - `SQLITE_ERROR` if an error occurs while getting the number of frames
+///   in the WAL file.
+///
+/// # Safety
+///
+/// - The `db` must be a valid pointer to a `sqlite3` database connection.
+/// - The `p_frame_count` must be a valid pointer to a `u32` that will store
+///   the number of frames in the WAL file.
+#[no_mangle]
+pub unsafe extern "C" fn libsql_wal_frame_count(
+    db: *mut sqlite3,
+    p_frame_count: *mut u32,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
     }
-
-    #[test]
-    fn test_libversion_number() {
-        unsafe {
-            let version_num = sqlite3_libversion_number();
-            assert_eq!(version_num, 3042000);
-        }
-    }
-
-    #[test]
-    fn test_open_misuse() {
-        unsafe {
-            let mut db = ptr::null_mut();
-            assert_eq!(sqlite3_open(ptr::null(), &mut db), SQLITE_MISUSE);
-        }
-    }
-
-    #[test]
-    fn test_open_not_found() {
-        unsafe {
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(b"not-found/local.db\0".as_ptr() as *const i8, &mut db),
-                SQLITE_CANTOPEN
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_open_existing() {
-        unsafe {
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
-
-    #[test]
-    fn test_close() {
-        unsafe {
-            assert_eq!(sqlite3_close(ptr::null_mut()), SQLITE_OK);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_prepare_misuse() {
-        unsafe {
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
-                SQLITE_OK
-            );
-
-            let mut stmt = ptr::null_mut();
-            assert_eq!(
-                sqlite3_prepare_v2(
-                    db,
-                    b"SELECT 1\0".as_ptr() as *const i8,
-                    -1,
-                    &mut stmt,
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_wal_checkpoint() {
-        unsafe {
-            // Test with NULL db handle
-            assert_eq!(
-                sqlite3_wal_checkpoint(ptr::null_mut(), ptr::null()),
-                SQLITE_MISUSE
-            );
-
-            // Test with valid db
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_wal_checkpoint(db, ptr::null()), SQLITE_OK);
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_wal_checkpoint_v2() {
-        unsafe {
-            // Test with NULL db handle
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    ptr::null_mut(),
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_PASSIVE,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_MISUSE
-            );
-
-            // Test with valid db
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
-                SQLITE_OK
-            );
-
-            let mut log_size = 0;
-            let mut checkpoint_count = 0;
-
-            // Test different checkpoint modes
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_PASSIVE,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_FULL,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_RESTART,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_TRUNCATE,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
+    let db: &mut sqlite3 = &mut *db;
+    let frame_count = match db.conn.wal_frame_count() {
+        Ok(count) => count as u32,
+        Err(_) => return SQLITE_ERROR,
+    };
+    *p_frame_count = frame_count;
+    SQLITE_OK
 }

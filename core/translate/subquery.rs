@@ -1,4 +1,5 @@
 use crate::{
+    schema::Table,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Result,
 };
@@ -6,7 +7,7 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, SelectPlan, SelectQueryType, TableReference},
+    plan::{SelectPlan, SelectQueryType, TableReference},
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -16,18 +17,15 @@ pub fn emit_subqueries(
     t_ctx: &mut TranslateCtx,
     tables: &mut [TableReference],
 ) -> Result<()> {
-    for table in tables.iter_mut() {
-        if let Operation::Subquery {
-            plan,
-            result_columns_start_reg,
-        } = &mut table.op
-        {
+    for table_reference in tables.iter_mut() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
-            let result_columns_start = emit_subquery(program, plan, t_ctx)?;
+            let result_columns_start =
+                emit_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
-            *result_columns_start_reg = result_columns_start;
+            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
         }
     }
     Ok(())
@@ -52,7 +50,7 @@ pub fn emit_subquery<'a>(
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
-    let coroutine_implementation_start_offset = program.offset().add(1u32);
+    let coroutine_implementation_start_offset = program.allocate_label();
     match &mut plan.query_type {
         SelectQueryType::Subquery {
             yield_reg: y,
@@ -90,6 +88,7 @@ pub fn emit_subquery<'a>(
         jump_on_definition: subquery_body_end_label,
         start_offset: coroutine_implementation_start_offset,
     });
+    program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
     // Normally we mark each LIMIT value as a constant insn that is emitted only once, but in the case of a subquery,
     // we need to initialize it every time the subquery is run; otherwise subsequent runs of the subquery will already
     // have the LIMIT counter at 0, and will never return rows.
@@ -102,6 +101,6 @@ pub fn emit_subquery<'a>(
     let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
     program.resolve_label(end_coroutine_label, program.offset());
     program.emit_insn(Insn::EndCoroutine { yield_reg });
-    program.resolve_label(subquery_body_end_label, program.offset());
+    program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
 }

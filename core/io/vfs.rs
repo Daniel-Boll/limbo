@@ -1,4 +1,4 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Completion, File, MemoryIO, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, Result};
@@ -24,7 +24,7 @@ impl IO for VfsMod {
         })?;
         let ctx = self.ctx as *mut c_void;
         let vfs = unsafe { &*self.ctx };
-        let file = unsafe { (vfs.open)(ctx, c_path.as_ptr(), flags.to_flags(), direct) };
+        let file = unsafe { (vfs.open)(ctx, c_path.as_ptr(), flags.0, direct) };
         if file.is_null() {
             return Err(LimboError::ExtensionError("File not found".to_string()));
         }
@@ -49,6 +49,10 @@ impl IO for VfsMod {
         }
         let vfs = unsafe { &*self.ctx };
         unsafe { (vfs.gen_random_number)() }
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

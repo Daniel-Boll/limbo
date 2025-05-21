@@ -1,10 +1,14 @@
 use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
+use limbo_sqlite3_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
+use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
+use crate::translate::collate::CollationSeq;
+use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::{Register, VTabOpaqueCursor};
 use crate::Result;
@@ -13,13 +17,27 @@ use std::fmt::Display;
 const MAX_REAL_SIZE: u8 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OwnedValueType {
+pub enum ValueType {
     Null,
     Integer,
     Float,
     Text,
     Blob,
     Error,
+}
+
+impl Display for ValueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Null => "NULL",
+            Self::Integer => "INT",
+            Self::Float => "REAL",
+            Self::Blob => "BLOB",
+            Self::Text => "TEXT",
+            Self::Error => "ERROR",
+        };
+        write!(f, "{}", value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +70,7 @@ impl Text {
             subtype: TextSubtype::Text,
         }
     }
+
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
@@ -69,6 +88,15 @@ impl Text {
     }
 }
 
+impl From<String> for Text {
+    fn from(value: String) -> Self {
+        Text {
+            value: value.into_bytes(),
+            subtype: TextSubtype::Text,
+        }
+    }
+}
+
 impl TextRef {
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }
@@ -80,7 +108,7 @@ impl TextRef {
 }
 
 #[derive(Debug, Clone)]
-pub enum OwnedValue {
+pub enum Value {
     Null,
     Integer(i64),
     Float(f64),
@@ -103,10 +131,10 @@ pub enum RefValue {
     Blob(RawSlice),
 }
 
-impl OwnedValue {
-    // A helper function that makes building a text OwnedValue easier.
-    pub fn build_text(text: &str) -> Self {
-        Self::Text(Text::new(text))
+impl Value {
+    // A helper function that makes building a text Value easier.
+    pub fn build_text(text: impl AsRef<str>) -> Self {
+        Self::Text(Text::new(text.as_ref()))
     }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -117,47 +145,47 @@ impl OwnedValue {
     }
 
     pub fn from_blob(data: Vec<u8>) -> Self {
-        OwnedValue::Blob(data)
+        Value::Blob(data)
     }
 
     pub fn to_text(&self) -> Option<&str> {
         match self {
-            OwnedValue::Text(t) => Some(t.as_str()),
+            Value::Text(t) => Some(t.as_str()),
             _ => None,
         }
     }
 
     pub fn from_text(text: &str) -> Self {
-        OwnedValue::Text(Text::new(text))
+        Value::Text(Text::new(text))
     }
 
-    pub fn value_type(&self) -> OwnedValueType {
+    pub fn value_type(&self) -> ValueType {
         match self {
-            OwnedValue::Null => OwnedValueType::Null,
-            OwnedValue::Integer(_) => OwnedValueType::Integer,
-            OwnedValue::Float(_) => OwnedValueType::Float,
-            OwnedValue::Text(_) => OwnedValueType::Text,
-            OwnedValue::Blob(_) => OwnedValueType::Blob,
+            Value::Null => ValueType::Null,
+            Value::Integer(_) => ValueType::Integer,
+            Value::Float(_) => ValueType::Float,
+            Value::Text(_) => ValueType::Text,
+            Value::Blob(_) => ValueType::Blob,
         }
     }
     pub fn serialize_serial(&self, out: &mut Vec<u8>) {
         match self {
-            OwnedValue::Null => {}
-            OwnedValue::Integer(i) => {
+            Value::Null => {}
+            Value::Integer(i) => {
                 let serial_type = SerialType::from(self);
-                match serial_type {
-                    SerialType::I8 => out.extend_from_slice(&(*i as i8).to_be_bytes()),
-                    SerialType::I16 => out.extend_from_slice(&(*i as i16).to_be_bytes()),
-                    SerialType::I24 => out.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
-                    SerialType::I32 => out.extend_from_slice(&(*i as i32).to_be_bytes()),
-                    SerialType::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
-                    SerialType::I64 => out.extend_from_slice(&i.to_be_bytes()),
+                match serial_type.kind() {
+                    SerialTypeKind::I8 => out.extend_from_slice(&(*i as i8).to_be_bytes()),
+                    SerialTypeKind::I16 => out.extend_from_slice(&(*i as i16).to_be_bytes()),
+                    SerialTypeKind::I24 => out.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
+                    SerialTypeKind::I32 => out.extend_from_slice(&(*i as i32).to_be_bytes()),
+                    SerialTypeKind::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
+                    SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
                     _ => unreachable!(),
                 }
             }
-            OwnedValue::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            OwnedValue::Text(t) => out.extend_from_slice(&t.value),
-            OwnedValue::Blob(b) => out.extend_from_slice(b),
+            Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
+            Value::Text(t) => out.extend_from_slice(&t.value),
+            Value::Blob(b) => out.extend_from_slice(b),
         };
     }
 }
@@ -168,11 +196,11 @@ pub struct ExternalAggState {
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
-    pub finalized_value: Option<OwnedValue>,
+    pub finalized_value: Option<Value>,
 }
 
 impl ExternalAggState {
-    pub fn cache_final_value(&mut self, value: OwnedValue) -> &OwnedValue {
+    pub fn cache_final_value(&mut self, value: Value) -> &Value {
         self.finalized_value = Some(value);
         self.finalized_value.as_ref().unwrap()
     }
@@ -184,11 +212,11 @@ impl ExternalAggState {
 /// format!("{}", value);
 /// ---BAD---
 /// match value {
-///   OwnedValue::Integer(i) => *i.as_str(),
-///   OwnedValue::Float(f) => *f.as_str(),
+///   Value::Integer(i) => *i.as_str(),
+///   Value::Float(f) => *f.as_str(),
 ///   ....
 /// }
-impl Display for OwnedValue {
+impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, ""),
@@ -197,6 +225,12 @@ impl Display for OwnedValue {
             }
             Self::Float(fl) => {
                 let fl = *fl;
+                if fl == f64::INFINITY {
+                    return write!(f, "Inf");
+                }
+                if fl == f64::NEG_INFINITY {
+                    return write!(f, "-Inf");
+                }
                 if fl.is_nan() {
                     return write!(f, "");
                 }
@@ -298,7 +332,7 @@ impl Display for OwnedValue {
     }
 }
 
-impl OwnedValue {
+impl Value {
     pub fn to_ffi(&self) -> ExtValue {
         match self {
             Self::Null => ExtValue::null(),
@@ -311,38 +345,38 @@ impl OwnedValue {
 
     pub fn from_ffi(v: ExtValue) -> Result<Self> {
         let res = match v.value_type() {
-            ExtValueType::Null => Ok(OwnedValue::Null),
+            ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
                 let Some(int) = v.to_integer() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Value::Null);
                 };
-                Ok(OwnedValue::Integer(int))
+                Ok(Value::Integer(int))
             }
             ExtValueType::Float => {
                 let Some(float) = v.to_float() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Value::Null);
                 };
-                Ok(OwnedValue::Float(float))
+                Ok(Value::Float(float))
             }
             ExtValueType::Text => {
                 let Some(text) = v.to_text() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Value::Null);
                 };
                 #[cfg(feature = "json")]
                 if v.is_json() {
-                    return Ok(OwnedValue::Text(Text::json(text.to_string())));
+                    return Ok(Value::Text(Text::json(text.to_string())));
                 }
-                Ok(OwnedValue::build_text(text))
+                Ok(Value::build_text(text))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Value::Null);
                 };
-                Ok(OwnedValue::Blob(blob))
+                Ok(Value::Blob(blob))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Value::Null);
                 };
                 match err {
                     (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
@@ -357,29 +391,29 @@ impl OwnedValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggContext {
-    Avg(OwnedValue, OwnedValue), // acc and count
-    Sum(OwnedValue),
-    Count(OwnedValue),
-    Max(Option<OwnedValue>),
-    Min(Option<OwnedValue>),
-    GroupConcat(OwnedValue),
+    Avg(Value, Value), // acc and count
+    Sum(Value),
+    Count(Value),
+    Max(Option<Value>),
+    Min(Option<Value>),
+    GroupConcat(Value),
     External(ExternalAggState),
 }
 
-const NULL: OwnedValue = OwnedValue::Null;
+const NULL: Value = Value::Null;
 
 impl AggContext {
     pub fn compute_external(&mut self) -> Result<()> {
         if let Self::External(ext_state) = self {
             if ext_state.finalized_value.is_none() {
                 let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-                ext_state.cache_final_value(OwnedValue::from_ffi(final_value)?);
+                ext_state.cache_final_value(Value::from_ffi(final_value)?);
             }
         }
         Ok(())
     }
 
-    pub fn final_value(&self) -> &OwnedValue {
+    pub fn final_value(&self) -> &Value {
         match self {
             Self::Avg(acc, _count) => acc,
             Self::Sum(acc) => acc,
@@ -392,8 +426,8 @@ impl AggContext {
     }
 }
 
-impl PartialEq<OwnedValue> for OwnedValue {
-    fn eq(&self, other: &OwnedValue) -> bool {
+impl PartialEq<Value> for Value {
+    fn eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
             (Self::Integer(int_left), Self::Float(float_right)) => {
@@ -414,13 +448,13 @@ impl PartialEq<OwnedValue> for OwnedValue {
         }
     }
 
-    fn ne(&self, other: &OwnedValue) -> bool {
+    fn ne(&self, other: &Value) -> bool {
         !self.eq(other)
     }
 }
 
 #[allow(clippy::non_canonical_partial_ord_impl)]
-impl PartialOrd<OwnedValue> for OwnedValue {
+impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
@@ -470,16 +504,16 @@ impl PartialOrd<AggContext> for AggContext {
     }
 }
 
-impl Eq for OwnedValue {}
+impl Eq for Value {}
 
-impl Ord for OwnedValue {
+impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
     }
 }
 
-impl std::ops::Add<OwnedValue> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Add<Value> for Value {
+    type Output = Value;
 
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
@@ -519,8 +553,8 @@ impl std::ops::Add<OwnedValue> for OwnedValue {
     }
 }
 
-impl std::ops::Add<f64> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Add<f64> for Value {
+    type Output = Value;
 
     fn add(self, rhs: f64) -> Self::Output {
         match self {
@@ -531,8 +565,8 @@ impl std::ops::Add<f64> for OwnedValue {
     }
 }
 
-impl std::ops::Add<i64> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Add<i64> for Value {
+    type Output = Value;
 
     fn add(self, rhs: i64) -> Self::Output {
         match self {
@@ -543,28 +577,28 @@ impl std::ops::Add<i64> for OwnedValue {
     }
 }
 
-impl std::ops::AddAssign for OwnedValue {
+impl std::ops::AddAssign for Value {
     fn add_assign(&mut self, rhs: Self) {
         *self = self.clone() + rhs;
     }
 }
 
-impl std::ops::AddAssign<i64> for OwnedValue {
+impl std::ops::AddAssign<i64> for Value {
     fn add_assign(&mut self, rhs: i64) {
         *self = self.clone() + rhs;
     }
 }
 
-impl std::ops::AddAssign<f64> for OwnedValue {
+impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
         *self = self.clone() + rhs;
     }
 }
 
-impl std::ops::Div<OwnedValue> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Div<Value> for Value {
+    type Output = Value;
 
-    fn div(self, rhs: OwnedValue) -> Self::Output {
+    fn div(self, rhs: Value) -> Self::Output {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
                 Self::Integer(int_left / int_right)
@@ -583,8 +617,8 @@ impl std::ops::Div<OwnedValue> for OwnedValue {
     }
 }
 
-impl std::ops::DivAssign<OwnedValue> for OwnedValue {
-    fn div_assign(&mut self, rhs: OwnedValue) {
+impl std::ops::DivAssign<Value> for Value {
+    fn div_assign(&mut self, rhs: Value) {
         *self = self.clone() / rhs;
     }
 }
@@ -638,7 +672,7 @@ pub struct ImmutableRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
-    values: Vec<OwnedValue>,
+    values: Vec<Value>,
 }
 
 impl Record {
@@ -651,15 +685,15 @@ impl Record {
         self.values.len()
     }
 
-    pub fn last_value(&self) -> Option<&OwnedValue> {
+    pub fn last_value(&self) -> Option<&Value> {
         self.values.last()
     }
 
-    pub fn get_values(&self) -> &Vec<OwnedValue> {
+    pub fn get_values(&self) -> &Vec<Value> {
         &self.values
     }
 
-    pub fn get_value(&self, idx: usize) -> &OwnedValue {
+    pub fn get_value(&self, idx: usize) -> &Value {
         &self.values[idx]
     }
 
@@ -754,18 +788,7 @@ impl ImmutableRecord {
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
             serials.push((serial_type_buf, n));
 
-            let value_size = match serial_type {
-                SerialType::Null => 0,
-                SerialType::I8 => 1,
-                SerialType::I16 => 2,
-                SerialType::I24 => 3,
-                SerialType::I32 => 4,
-                SerialType::I48 => 6,
-                SerialType::I64 => 8,
-                SerialType::F64 => 8,
-                SerialType::Text { content_size } => content_size,
-                SerialType::Blob { content_size } => content_size,
-            };
+            let value_size = serial_type.size();
 
             size_header += n;
             size_values += value_size;
@@ -806,29 +829,30 @@ impl ImmutableRecord {
             let value = value.get_owned_value();
             let start_offset = writer.pos;
             match value {
-                OwnedValue::Null => {
+                Value::Null => {
                     values.push(RefValue::Null);
                 }
-                OwnedValue::Integer(i) => {
+                Value::Integer(i) => {
                     values.push(RefValue::Integer(*i));
                     let serial_type = SerialType::from(value);
-                    match serial_type {
-                        SerialType::I8 => writer.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialType::I16 => writer.extend_from_slice(&(*i as i16).to_be_bytes()),
-                        SerialType::I24 => {
+                    match serial_type.kind() {
+                        SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
+                        SerialTypeKind::I8 => writer.extend_from_slice(&(*i as i8).to_be_bytes()),
+                        SerialTypeKind::I16 => writer.extend_from_slice(&(*i as i16).to_be_bytes()),
+                        SerialTypeKind::I24 => {
                             writer.extend_from_slice(&(*i as i32).to_be_bytes()[1..])
                         } // remove most significant byte
-                        SerialType::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
-                        SerialType::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
-                        SerialType::I64 => writer.extend_from_slice(&i.to_be_bytes()),
-                        _ => unreachable!(),
+                        SerialTypeKind::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialTypeKind::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
+                        SerialTypeKind::I64 => writer.extend_from_slice(&i.to_be_bytes()),
+                        other => panic!("Serial type is not an integer: {:?}", other),
                     }
                 }
-                OwnedValue::Float(f) => {
+                Value::Float(f) => {
                     values.push(RefValue::Float(*f));
                     writer.extend_from_slice(&f.to_be_bytes())
                 }
-                OwnedValue::Text(t) => {
+                Value::Text(t) => {
                     writer.extend_from_slice(&t.value);
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
@@ -839,7 +863,7 @@ impl ImmutableRecord {
                     });
                     values.push(value);
                 }
-                OwnedValue::Blob(b) => {
+                Value::Blob(b) => {
                     writer.extend_from_slice(b);
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
@@ -878,6 +902,26 @@ impl ImmutableRecord {
 
     pub fn get_payload(&self) -> &[u8] {
         &self.payload
+    }
+}
+
+impl Display for ImmutableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for value in &self.values {
+            match value {
+                RefValue::Null => write!(f, "NULL")?,
+                RefValue::Integer(i) => write!(f, "Integer({})", *i)?,
+                RefValue::Float(flo) => write!(f, "Float({})", *flo)?,
+                RefValue::Text(text_ref) => write!(f, "Text({})", text_ref.as_str())?,
+                RefValue::Blob(raw_slice) => {
+                    write!(f, "Blob({})", String::from_utf8_lossy(raw_slice.to_slice()))?
+                }
+            }
+            if value != self.values.last().unwrap() {
+                write!(f, ", ")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -934,16 +978,16 @@ impl RefValue {
         }
     }
 
-    pub fn to_owned(&self) -> OwnedValue {
+    pub fn to_owned(&self) -> Value {
         match self {
-            RefValue::Null => OwnedValue::Null,
-            RefValue::Integer(i) => OwnedValue::Integer(*i),
-            RefValue::Float(f) => OwnedValue::Float(*f),
-            RefValue::Text(text_ref) => OwnedValue::Text(Text {
+            RefValue::Null => Value::Null,
+            RefValue::Integer(i) => Value::Integer(*i),
+            RefValue::Float(f) => Value::Float(*f),
+            RefValue::Text(text_ref) => Value::Text(Text {
                 value: text_ref.value.to_slice().to_vec(),
                 subtype: text_ref.subtype.clone(),
             }),
-            RefValue::Blob(b) => OwnedValue::Blob(b.to_slice().to_vec()),
+            RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
         }
     }
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -1013,8 +1057,98 @@ impl PartialOrd<RefValue> for RefValue {
     }
 }
 
-pub fn compare_immutable(l: &[RefValue], r: &[RefValue]) -> std::cmp::Ordering {
-    l.partial_cmp(r).unwrap()
+/// A bitfield that represents the comparison spec for index keys.
+/// Since indexed columns can individually specify ASC/DESC, each key must
+/// be compared differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct IndexKeySortOrder(u64);
+
+impl IndexKeySortOrder {
+    pub fn get_sort_order_for_col(&self, column_idx: usize) -> SortOrder {
+        assert!(column_idx < 64, "column index out of range: {}", column_idx);
+        match self.0 & (1 << column_idx) {
+            0 => SortOrder::Asc,
+            _ => SortOrder::Desc,
+        }
+    }
+
+    pub fn from_index(index: &Index) -> Self {
+        let mut spec = 0;
+        for (i, column) in index.columns.iter().enumerate() {
+            spec |= ((column.order == SortOrder::Desc) as u64) << i;
+        }
+        IndexKeySortOrder(spec)
+    }
+
+    pub fn from_list(order: &[SortOrder]) -> Self {
+        let mut spec = 0;
+        for (i, order) in order.iter().enumerate() {
+            spec |= ((*order == SortOrder::Desc) as u64) << i;
+        }
+        IndexKeySortOrder(spec)
+    }
+
+    pub fn default() -> Self {
+        Self(0)
+    }
+}
+
+impl Default for IndexKeySortOrder {
+    fn default() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Metadata about an index, used for handling and comparing index keys.
+///
+/// This struct provides information about the sorting order of columns,
+/// whether the index includes a row ID, and the total number of columns
+/// in the index.
+pub struct IndexKeyInfo {
+    /// Specifies the sorting order (ascending or descending) for each column in the index.
+    pub sort_order: IndexKeySortOrder,
+    /// Indicates whether the index includes a row ID column.
+    pub has_rowid: bool,
+    /// The total number of columns in the index, including the row ID column if present.
+    pub num_cols: usize,
+}
+
+impl IndexKeyInfo {
+    pub fn new_from_index(index: &Index) -> Self {
+        Self {
+            sort_order: IndexKeySortOrder::from_index(index),
+            has_rowid: index.has_rowid,
+            num_cols: index.columns.len() + (index.has_rowid as usize),
+        }
+    }
+}
+
+pub fn compare_immutable(
+    l: &[RefValue],
+    r: &[RefValue],
+    index_key_sort_order: IndexKeySortOrder,
+    collations: &[CollationSeq],
+) -> std::cmp::Ordering {
+    assert_eq!(l.len(), r.len());
+    for (i, (l, r)) in l.iter().zip(r).enumerate() {
+        let column_order = index_key_sort_order.get_sort_order_for_col(i);
+        let collation = collations.get(i).copied().unwrap_or_default();
+        let cmp = match (l, r) {
+            (RefValue::Text(left), RefValue::Text(right)) => {
+                collation.compare_strings(left.as_str(), right.as_str())
+            }
+            _ => l.partial_cmp(r).unwrap(),
+        };
+        if !cmp.is_eq() {
+            return match column_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            };
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 const I8_LOW: i64 = -128;
@@ -1031,7 +1165,11 @@ const I48_HIGH: i64 = 140737488355327;
 /// Sqlite Serial Types
 /// https://www.sqlite.org/fileformat.html#record_format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SerialType {
+#[repr(transparent)]
+pub struct SerialType(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SerialTypeKind {
     Null,
     I8,
     I16,
@@ -1040,52 +1178,159 @@ enum SerialType {
     I48,
     I64,
     F64,
-    Text { content_size: usize },
-    Blob { content_size: usize },
+    ConstInt0,
+    ConstInt1,
+    Text,
+    Blob,
 }
 
-impl From<&OwnedValue> for SerialType {
-    fn from(value: &OwnedValue) -> Self {
+impl SerialType {
+    #[inline(always)]
+    pub fn u64_is_valid_serial_type(n: u64) -> bool {
+        n != 10 && n != 11
+    }
+
+    const NULL: Self = Self(0);
+    const I8: Self = Self(1);
+    const I16: Self = Self(2);
+    const I24: Self = Self(3);
+    const I32: Self = Self(4);
+    const I48: Self = Self(5);
+    const I64: Self = Self(6);
+    const F64: Self = Self(7);
+    const CONST_INT0: Self = Self(8);
+    const CONST_INT1: Self = Self(9);
+
+    pub fn null() -> Self {
+        Self::NULL
+    }
+
+    pub fn i8() -> Self {
+        Self::I8
+    }
+
+    pub fn i16() -> Self {
+        Self::I16
+    }
+
+    pub fn i24() -> Self {
+        Self::I24
+    }
+
+    pub fn i32() -> Self {
+        Self::I32
+    }
+
+    pub fn i48() -> Self {
+        Self::I48
+    }
+
+    pub fn i64() -> Self {
+        Self::I64
+    }
+
+    pub fn f64() -> Self {
+        Self::F64
+    }
+
+    pub fn const_int0() -> Self {
+        Self::CONST_INT0
+    }
+
+    pub fn const_int1() -> Self {
+        Self::CONST_INT1
+    }
+
+    pub fn blob(size: u64) -> Self {
+        Self(12 + size * 2)
+    }
+
+    pub fn text(size: u64) -> Self {
+        Self(13 + size * 2)
+    }
+
+    pub fn kind(&self) -> SerialTypeKind {
+        match self.0 {
+            0 => SerialTypeKind::Null,
+            1 => SerialTypeKind::I8,
+            2 => SerialTypeKind::I16,
+            3 => SerialTypeKind::I24,
+            4 => SerialTypeKind::I32,
+            5 => SerialTypeKind::I48,
+            6 => SerialTypeKind::I64,
+            7 => SerialTypeKind::F64,
+            8 => SerialTypeKind::ConstInt0,
+            9 => SerialTypeKind::ConstInt1,
+            n if n >= 12 => match n % 2 {
+                0 => SerialTypeKind::Blob,
+                1 => SerialTypeKind::Text,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self.kind() {
+            SerialTypeKind::Null => 0,
+            SerialTypeKind::I8 => 1,
+            SerialTypeKind::I16 => 2,
+            SerialTypeKind::I24 => 3,
+            SerialTypeKind::I32 => 4,
+            SerialTypeKind::I48 => 6,
+            SerialTypeKind::I64 => 8,
+            SerialTypeKind::F64 => 8,
+            SerialTypeKind::ConstInt0 => 0,
+            SerialTypeKind::ConstInt1 => 0,
+            SerialTypeKind::Text => (self.0 as usize - 13) / 2,
+            SerialTypeKind::Blob => (self.0 as usize - 12) / 2,
+        }
+    }
+}
+
+impl From<&Value> for SerialType {
+    fn from(value: &Value) -> Self {
         match value {
-            OwnedValue::Null => SerialType::Null,
-            OwnedValue::Integer(i) => match i {
-                i if *i >= I8_LOW && *i <= I8_HIGH => SerialType::I8,
-                i if *i >= I16_LOW && *i <= I16_HIGH => SerialType::I16,
-                i if *i >= I24_LOW && *i <= I24_HIGH => SerialType::I24,
-                i if *i >= I32_LOW && *i <= I32_HIGH => SerialType::I32,
-                i if *i >= I48_LOW && *i <= I48_HIGH => SerialType::I48,
-                _ => SerialType::I64,
+            Value::Null => SerialType::null(),
+            Value::Integer(i) => match i {
+                0 => SerialType::const_int0(),
+                1 => SerialType::const_int1(),
+                i if *i >= I8_LOW && *i <= I8_HIGH => SerialType::i8(),
+                i if *i >= I16_LOW && *i <= I16_HIGH => SerialType::i16(),
+                i if *i >= I24_LOW && *i <= I24_HIGH => SerialType::i24(),
+                i if *i >= I32_LOW && *i <= I32_HIGH => SerialType::i32(),
+                i if *i >= I48_LOW && *i <= I48_HIGH => SerialType::i48(),
+                _ => SerialType::i64(),
             },
-            OwnedValue::Float(_) => SerialType::F64,
-            OwnedValue::Text(t) => SerialType::Text {
-                content_size: t.value.len(),
-            },
-            OwnedValue::Blob(b) => SerialType::Blob {
-                content_size: b.len(),
-            },
+            Value::Float(_) => SerialType::f64(),
+            Value::Text(t) => SerialType::text(t.value.len() as u64),
+            Value::Blob(b) => SerialType::blob(b.len() as u64),
         }
     }
 }
 
 impl From<SerialType> for u64 {
     fn from(serial_type: SerialType) -> Self {
-        match serial_type {
-            SerialType::Null => 0,
-            SerialType::I8 => 1,
-            SerialType::I16 => 2,
-            SerialType::I24 => 3,
-            SerialType::I32 => 4,
-            SerialType::I48 => 5,
-            SerialType::I64 => 6,
-            SerialType::F64 => 7,
-            SerialType::Text { content_size } => (content_size * 2 + 13) as u64,
-            SerialType::Blob { content_size } => (content_size * 2 + 12) as u64,
+        serial_type.0
+    }
+}
+
+impl TryFrom<u64> for SerialType {
+    type Error = LimboError;
+
+    fn try_from(uint: u64) -> Result<Self> {
+        if uint == 10 || uint == 11 {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid serial type: {}",
+                uint
+            )));
         }
+        Ok(SerialType(uint))
     }
 }
 
 impl Record {
-    pub fn new(values: Vec<OwnedValue>) -> Self {
+    pub fn new(values: Vec<Value>) -> Self {
         Self { values }
     }
 
@@ -1105,22 +1350,24 @@ impl Record {
         // write content
         for value in &self.values {
             match value {
-                OwnedValue::Null => {}
-                OwnedValue::Integer(i) => {
+                Value::Null => {}
+                Value::Integer(i) => {
                     let serial_type = SerialType::from(value);
-                    match serial_type {
-                        SerialType::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialType::I16 => buf.extend_from_slice(&(*i as i16).to_be_bytes()),
-                        SerialType::I24 => buf.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
-                        SerialType::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
-                        SerialType::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
-                        SerialType::I64 => buf.extend_from_slice(&i.to_be_bytes()),
+                    match serial_type.kind() {
+                        SerialTypeKind::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),
+                        SerialTypeKind::I16 => buf.extend_from_slice(&(*i as i16).to_be_bytes()),
+                        SerialTypeKind::I24 => {
+                            buf.extend_from_slice(&(*i as i32).to_be_bytes()[1..])
+                        } // remove most significant byte
+                        SerialTypeKind::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialTypeKind::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
+                        SerialTypeKind::I64 => buf.extend_from_slice(&i.to_be_bytes()),
                         _ => unreachable!(),
                     }
                 }
-                OwnedValue::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                OwnedValue::Text(t) => buf.extend_from_slice(&t.value),
-                OwnedValue::Blob(b) => buf.extend_from_slice(b),
+                Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
+                Value::Text(t) => buf.extend_from_slice(&t.value),
+                Value::Blob(b) => buf.extend_from_slice(b),
             };
         }
 
@@ -1197,11 +1444,43 @@ pub enum CursorResult<T> {
     IO,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The match condition of a table/index seek.
 pub enum SeekOp {
     EQ,
     GE,
     GT,
+    LE,
+    LT,
+}
+
+impl SeekOp {
+    /// A given seek op implies an iteration direction.
+    ///
+    /// For example, a seek with SeekOp::GT implies:
+    /// Find the first table/index key that compares greater than the seek key
+    /// -> used in forwards iteration.
+    ///
+    /// A seek with SeekOp::LE implies:
+    /// Find the last table/index key that compares less than or equal to the seek key
+    /// -> used in backwards iteration.
+    #[inline(always)]
+    pub fn iteration_direction(&self) -> IterationDirection {
+        match self {
+            SeekOp::EQ | SeekOp::GE | SeekOp::GT => IterationDirection::Forwards,
+            SeekOp::LE | SeekOp::LT => IterationDirection::Backwards,
+        }
+    }
+
+    pub fn reverse(&self) -> Self {
+        match self {
+            SeekOp::EQ => SeekOp::EQ,
+            SeekOp::GE => SeekOp::LE,
+            SeekOp::GT => SeekOp::LT,
+            SeekOp::LE => SeekOp::GE,
+            SeekOp::LT => SeekOp::GT,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -1229,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_serialize_null() {
-        let record = Record::new(vec![OwnedValue::Null]);
+        let record = Record::new(vec![Value::Null]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1238,7 +1517,7 @@ mod tests {
         // First byte should be header size
         assert_eq!(header[0], header_length as u8);
         // Second byte should be serial type for NULL
-        assert_eq!(header[1] as u64, u64::from(SerialType::Null));
+        assert_eq!(header[1] as u64, u64::from(SerialType::null()));
         // Check that the buffer is empty after the header
         assert_eq!(buf.len(), header_length);
     }
@@ -1246,12 +1525,12 @@ mod tests {
     #[test]
     fn test_serialize_integers() {
         let record = Record::new(vec![
-            OwnedValue::Integer(42),                // Should use SERIAL_TYPE_I8
-            OwnedValue::Integer(1000),              // Should use SERIAL_TYPE_I16
-            OwnedValue::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
-            OwnedValue::Integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
-            OwnedValue::Integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
-            OwnedValue::Integer(i64::MAX),          // Should use SERIAL_TYPE_I64
+            Value::Integer(42),                // Should use SERIAL_TYPE_I8
+            Value::Integer(1000),              // Should use SERIAL_TYPE_I16
+            Value::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
+            Value::Integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
+            Value::Integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
+            Value::Integer(i64::MAX),          // Should use SERIAL_TYPE_I64
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
@@ -1262,12 +1541,12 @@ mod tests {
         assert_eq!(header[0], header_length as u8); // Header should be larger than number of values
 
         // Check that correct serial types were chosen
-        assert_eq!(header[1] as u64, u64::from(SerialType::I8));
-        assert_eq!(header[2] as u64, u64::from(SerialType::I16));
-        assert_eq!(header[3] as u64, u64::from(SerialType::I24));
-        assert_eq!(header[4] as u64, u64::from(SerialType::I32));
-        assert_eq!(header[5] as u64, u64::from(SerialType::I48));
-        assert_eq!(header[6] as u64, u64::from(SerialType::I64));
+        assert_eq!(header[1] as u64, u64::from(SerialType::i8()));
+        assert_eq!(header[2] as u64, u64::from(SerialType::i16()));
+        assert_eq!(header[3] as u64, u64::from(SerialType::i24()));
+        assert_eq!(header[4] as u64, u64::from(SerialType::i32()));
+        assert_eq!(header[5] as u64, u64::from(SerialType::i48()));
+        assert_eq!(header[6] as u64, u64::from(SerialType::i64()));
 
         // test that the bytes after the header can be interpreted as the correct values
         let mut cur_offset = header_length;
@@ -1321,7 +1600,7 @@ mod tests {
     #[test]
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
-        let record = Record::new(vec![OwnedValue::Float(3.15555)]);
+        let record = Record::new(vec![Value::Float(3.15555)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1330,7 +1609,7 @@ mod tests {
         // First byte should be header size
         assert_eq!(header[0], header_length as u8);
         // Second byte should be serial type for FLOAT
-        assert_eq!(header[1] as u64, u64::from(SerialType::F64));
+        assert_eq!(header[1] as u64, u64::from(SerialType::f64()));
         // Check that the bytes after the header can be interpreted as the float
         let float_bytes = &buf[header_length..header_length + size_of::<f64>()];
         let float = f64::from_be_bytes(float_bytes.try_into().unwrap());
@@ -1342,7 +1621,7 @@ mod tests {
     #[test]
     fn test_serialize_text() {
         let text = "hello";
-        let record = Record::new(vec![OwnedValue::Text(Text::new(text))]);
+        let record = Record::new(vec![Value::Text(Text::new(text))]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1361,7 +1640,7 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
+        let record = Record::new(vec![Value::Blob(blob.clone())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1381,10 +1660,10 @@ mod tests {
     fn test_serialize_mixed_types() {
         let text = "test";
         let record = Record::new(vec![
-            OwnedValue::Null,
-            OwnedValue::Integer(42),
-            OwnedValue::Float(3.15),
-            OwnedValue::Text(Text::new(text)),
+            Value::Null,
+            Value::Integer(42),
+            Value::Float(3.15),
+            Value::Text(Text::new(text)),
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
@@ -1394,11 +1673,11 @@ mod tests {
         // First byte should be header size
         assert_eq!(header[0], header_length as u8);
         // Second byte should be serial type for NULL
-        assert_eq!(header[1] as u64, u64::from(SerialType::Null));
+        assert_eq!(header[1] as u64, u64::from(SerialType::null()));
         // Third byte should be serial type for I8
-        assert_eq!(header[2] as u64, u64::from(SerialType::I8));
+        assert_eq!(header[2] as u64, u64::from(SerialType::i8()));
         // Fourth byte should be serial type for F64
-        assert_eq!(header[3] as u64, u64::from(SerialType::F64));
+        assert_eq!(header[3] as u64, u64::from(SerialType::f64()));
         // Fifth byte should be serial type for TEXT, which is (len * 2 + 13)
         assert_eq!(header[4] as u64, (4 * 2 + 13) as u64);
 

@@ -1,6 +1,7 @@
 use super::{
     plan::{
-        Aggregate, EvalAt, JoinInfo, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
+        AggDistinctness, Aggregate, ColumnUsedMask, EvalAt, IterationDirection, JoinInfo,
+        JoinOrderMember, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
         TableReference, WhereTerm,
     },
     select::prepare_select_plan,
@@ -19,15 +20,20 @@ use limbo_sqlite3_parser::ast::{
 
 pub const ROWID: &str = "rowid";
 
-pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> bool {
+pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> Result<bool> {
     if aggs
         .iter()
         .any(|a| exprs_are_equivalent(&a.original_expr, expr))
     {
-        return true;
+        return Ok(true);
     }
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinctness,
+            ..
+        } => {
             let args_count = if let Some(args) = &args {
                 args.len()
             } else {
@@ -35,21 +41,29 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> bool {
             };
             match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), args_count) {
                 Ok(Func::Agg(f)) => {
+                    let distinctness = AggDistinctness::from_ast(distinctness.as_ref());
+                    let num_args = args.as_ref().map_or(0, |args| args.len());
+                    if distinctness.is_distinct() && num_args != 1 {
+                        crate::bail_parse_error!(
+                            "DISTINCT aggregate functions must have exactly one argument"
+                        );
+                    }
                     aggs.push(Aggregate {
                         func: f,
                         args: args.clone().unwrap_or_default(),
                         original_expr: expr.clone(),
+                        distinctness,
                     });
-                    true
+                    Ok(true)
                 }
                 _ => {
                     let mut contains_aggregates = false;
                     if let Some(args) = args {
                         for arg in args.iter() {
-                            contains_aggregates |= resolve_aggregates(arg, aggs);
+                            contains_aggregates |= resolve_aggregates(arg, aggs)?;
                         }
                     }
-                    contains_aggregates
+                    Ok(contains_aggregates)
                 }
             }
         }
@@ -61,31 +75,32 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> bool {
                     func: f,
                     args: vec![],
                     original_expr: expr.clone(),
+                    distinctness: AggDistinctness::NonDistinct,
                 });
-                true
+                Ok(true)
             } else {
-                false
+                Ok(false)
             }
         }
         Expr::Binary(lhs, _, rhs) => {
             let mut contains_aggregates = false;
-            contains_aggregates |= resolve_aggregates(lhs, aggs);
-            contains_aggregates |= resolve_aggregates(rhs, aggs);
-            contains_aggregates
+            contains_aggregates |= resolve_aggregates(lhs, aggs)?;
+            contains_aggregates |= resolve_aggregates(rhs, aggs)?;
+            Ok(contains_aggregates)
         }
         Expr::Unary(_, expr) => {
             let mut contains_aggregates = false;
-            contains_aggregates |= resolve_aggregates(expr, aggs);
-            contains_aggregates
+            contains_aggregates |= resolve_aggregates(expr, aggs)?;
+            Ok(contains_aggregates)
         }
         // TODO: handle other expressions that may contain aggregates
-        _ => false,
+        _ => Ok(false),
     }
 }
 
 pub fn bind_column_references(
     expr: &mut Expr,
-    referenced_tables: &[TableReference],
+    referenced_tables: &mut [TableReference],
     result_columns: Option<&[ResultSetColumn]>,
 ) -> Result<()> {
     match expr {
@@ -128,6 +143,7 @@ pub fn bind_column_references(
                     column: col_idx,
                     is_rowid_alias,
                 };
+                referenced_tables[tbl_idx].mark_column_used(col_idx);
                 return Ok(());
             }
 
@@ -178,6 +194,7 @@ pub fn bind_column_references(
                 column: col_idx.unwrap(),
                 is_rowid_alias: col.is_rowid_alias,
             };
+            referenced_tables[tbl_idx].mark_column_used(col_idx.unwrap());
             Ok(())
         }
         Expr::Between {
@@ -320,10 +337,14 @@ fn parse_from_clause_table<'a>(
                     ));
                 };
                 scope.tables.push(TableReference {
-                    op: Operation::Scan { iter_dir: None },
+                    op: Operation::Scan {
+                        iter_dir: IterationDirection::Forwards,
+                        index: None,
+                    },
                     table: tbl_ref,
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     join_info: None,
+                    col_used_mask: ColumnUsedMask::new(),
                 });
                 return Ok(());
             };
@@ -399,10 +420,14 @@ fn parse_from_clause_table<'a>(
                 .unwrap_or(normalized_name.to_string());
 
             scope.tables.push(TableReference {
-                op: Operation::Scan { iter_dir: None },
+                op: Operation::Scan {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                },
                 join_info: None,
                 table: Table::Virtual(vtab),
                 identifier: alias,
+                col_used_mask: ColumnUsedMask::new(),
             });
 
             Ok(())
@@ -533,7 +558,7 @@ pub fn parse_from<'a>(
 
 pub fn parse_where(
     where_clause: Option<Expr>,
-    table_references: &[TableReference],
+    table_references: &mut [TableReference],
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
 ) -> Result<()> {
@@ -544,11 +569,10 @@ pub fn parse_where(
             bind_column_references(expr, table_references, result_columns)?;
         }
         for expr in predicates {
-            let eval_at = determine_where_to_eval_expr(&expr)?;
             out_where_clause.push(WhereTerm {
                 expr,
-                from_outer_join: false,
-                eval_at,
+                from_outer_join: None,
+                consumed: false,
             });
         }
         Ok(())
@@ -564,15 +588,261 @@ pub fn parse_where(
   For expressions not referencing any tables (e.g. constants), this is before the main loop is
   opened, because they do not need any table data.
 */
-fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> {
+pub fn determine_where_to_eval_term(
+    term: &WhereTerm,
+    join_order: &[JoinOrderMember],
+) -> Result<EvalAt> {
+    if let Some(table_no) = term.from_outer_join {
+        return Ok(EvalAt::Loop(
+            join_order
+                .iter()
+                .position(|t| t.table_no == table_no)
+                .unwrap_or(usize::MAX),
+        ));
+    }
+
+    return determine_where_to_eval_expr(&term.expr, join_order);
+}
+
+/// A bitmask representing a set of tables in a query plan.
+/// Tables are numbered by their index in [SelectPlan::table_references].
+/// In the bitmask, the first bit is unused so that a mask with all zeros
+/// can represent "no tables".
+///
+/// E.g. table 0 is represented by bit index 1, table 1 by bit index 2, etc.
+///
+/// Usage in Join Optimization
+///
+/// In join optimization, [TableMask] is used to:
+/// - Generate subsets of tables for dynamic programming in join optimization
+/// - Ensure tables are joined in valid orders (e.g., respecting LEFT JOIN order)
+///
+/// Usage with constraints (WHERE clause)
+///
+/// [TableMask] helps determine:
+/// - Which tables are referenced in a constraint
+/// - When a constraint can be applied as a join condition (all referenced tables must be on the left side of the table being joined)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TableMask(pub u128);
+
+impl std::ops::BitOrAssign for TableMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl TableMask {
+    /// Creates a new empty table mask.
+    ///
+    /// The initial mask represents an empty set of tables.
+    pub fn new() -> Self {
+        Self(0)
+    }
+
+    /// Returns true if the mask represents an empty set of tables.
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Creates a new mask that is the same as this one but without the specified table.
+    pub fn without_table(&self, table_no: usize) -> Self {
+        assert!(table_no < 127, "table_no must be less than 127");
+        Self(self.0 ^ (1 << (table_no + 1)))
+    }
+
+    /// Creates a table mask from raw bits.
+    ///
+    /// The bits are shifted left by 1 to maintain the convention that table 0 is at bit 1.
+    pub fn from_bits(bits: u128) -> Self {
+        Self(bits << 1)
+    }
+
+    /// Creates a table mask from an iterator of table numbers.
+    pub fn from_table_number_iter(iter: impl Iterator<Item = usize>) -> Self {
+        iter.fold(Self::new(), |mut mask, table_no| {
+            assert!(table_no < 127, "table_no must be less than 127");
+            mask.add_table(table_no);
+            mask
+        })
+    }
+
+    /// Adds a table to the mask.
+    pub fn add_table(&mut self, table_no: usize) {
+        assert!(table_no < 127, "table_no must be less than 127");
+        self.0 |= 1 << (table_no + 1);
+    }
+
+    /// Returns true if the mask contains the specified table.
+    pub fn contains_table(&self, table_no: usize) -> bool {
+        assert!(table_no < 127, "table_no must be less than 127");
+        self.0 & (1 << (table_no + 1)) != 0
+    }
+
+    /// Returns true if this mask contains all tables in the other mask.
+    pub fn contains_all(&self, other: &TableMask) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Returns the number of tables in the mask.
+    pub fn table_count(&self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// Returns true if this mask shares any tables with the other mask.
+    pub fn intersects(&self, other: &TableMask) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+/// Returns a [TableMask] representing the tables referenced in the given expression.
+/// Used in the optimizer for constraint analysis.
+pub fn table_mask_from_expr(expr: &Expr) -> Result<TableMask> {
+    let mut mask = TableMask::new();
+    match expr {
+        Expr::Binary(e1, _, e2) => {
+            mask |= table_mask_from_expr(e1)?;
+            mask |= table_mask_from_expr(e2)?;
+        }
+        Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+            mask.add_table(*table);
+        }
+        Expr::Between {
+            lhs,
+            not: _,
+            start,
+            end,
+        } => {
+            mask |= table_mask_from_expr(lhs)?;
+            mask |= table_mask_from_expr(start)?;
+            mask |= table_mask_from_expr(end)?;
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                mask |= table_mask_from_expr(base)?;
+            }
+            for (when, then) in when_then_pairs {
+                mask |= table_mask_from_expr(when)?;
+                mask |= table_mask_from_expr(then)?;
+            }
+            if let Some(else_expr) = else_expr {
+                mask |= table_mask_from_expr(else_expr)?;
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            mask |= table_mask_from_expr(expr)?;
+        }
+        Expr::Collate(expr, _) => {
+            mask |= table_mask_from_expr(expr)?;
+        }
+        Expr::DoublyQualified(_, _, _) => {
+            crate::bail_parse_error!(
+                "DoublyQualified should be resolved to a Column before resolving table mask"
+            );
+        }
+        Expr::Exists(_) => {
+            todo!();
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over: _,
+            ..
+        } => {
+            if let Some(args) = args {
+                for arg in args.iter() {
+                    mask |= table_mask_from_expr(arg)?;
+                }
+            }
+            if let Some(order_by) = order_by {
+                for term in order_by.iter() {
+                    mask |= table_mask_from_expr(&term.expr)?;
+                }
+            }
+        }
+        Expr::FunctionCallStar { .. } => {}
+        Expr::Id(_) => panic!("Id should be resolved to a Column before resolving table mask"),
+        Expr::InList { lhs, not: _, rhs } => {
+            mask |= table_mask_from_expr(lhs)?;
+            if let Some(rhs) = rhs {
+                for rhs_expr in rhs.iter() {
+                    mask |= table_mask_from_expr(rhs_expr)?;
+                }
+            }
+        }
+        Expr::InSelect { .. } => todo!(),
+        Expr::InTable {
+            lhs,
+            not: _,
+            rhs: _,
+            args,
+        } => {
+            mask |= table_mask_from_expr(lhs)?;
+            if let Some(args) = args {
+                for arg in args.iter() {
+                    mask |= table_mask_from_expr(arg)?;
+                }
+            }
+        }
+        Expr::IsNull(expr) => {
+            mask |= table_mask_from_expr(expr)?;
+        }
+        Expr::Like {
+            lhs,
+            not: _,
+            op: _,
+            rhs,
+            escape,
+        } => {
+            mask |= table_mask_from_expr(lhs)?;
+            mask |= table_mask_from_expr(rhs)?;
+            if let Some(escape) = escape {
+                mask |= table_mask_from_expr(escape)?;
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::Name(_) => {}
+        Expr::NotNull(expr) => {
+            mask |= table_mask_from_expr(expr)?;
+        }
+        Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter() {
+                mask |= table_mask_from_expr(expr)?;
+            }
+        }
+        Expr::Qualified(_, _) => {
+            panic!("Qualified should be resolved to a Column before resolving table mask");
+        }
+        Expr::Raise(_, _) => todo!(),
+        Expr::Subquery(_) => todo!(),
+        Expr::Unary(_, expr) => {
+            mask |= table_mask_from_expr(expr)?;
+        }
+        Expr::Variable(_) => {}
+    }
+
+    Ok(mask)
+}
+
+pub fn determine_where_to_eval_expr<'a>(
+    expr: &'a Expr,
+    join_order: &[JoinOrderMember],
+) -> Result<EvalAt> {
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
-    match predicate {
+    match expr {
         ast::Expr::Binary(e1, _, e2) => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(e1)?);
-            eval_at = eval_at.max(determine_where_to_eval_expr(e2)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(e1, join_order)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(e2, join_order)?);
         }
         ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-            eval_at = eval_at.max(EvalAt::Loop(*table));
+            let join_idx = join_order
+                .iter()
+                .position(|t| t.table_no == *table)
+                .unwrap_or(usize::MAX);
+            eval_at = eval_at.max(EvalAt::Loop(join_idx));
         }
         ast::Expr::Id(_) => {
             /* Id referring to column will already have been rewritten as an Expr::Column */
@@ -583,30 +853,30 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
         }
         ast::Expr::Literal(_) => {}
         ast::Expr::Like { lhs, rhs, .. } => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
-            eval_at = eval_at.max(determine_where_to_eval_expr(rhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs, join_order)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(rhs, join_order)?);
         }
         ast::Expr::FunctionCall {
             args: Some(args), ..
         } => {
             for arg in args {
-                eval_at = eval_at.max(determine_where_to_eval_expr(arg)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(arg, join_order)?);
             }
         }
         ast::Expr::InList { lhs, rhs, .. } => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs, join_order)?);
             if let Some(rhs_list) = rhs {
                 for rhs_expr in rhs_list {
-                    eval_at = eval_at.max(determine_where_to_eval_expr(rhs_expr)?);
+                    eval_at = eval_at.max(determine_where_to_eval_expr(rhs_expr, join_order)?);
                 }
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
-            eval_at = eval_at.max(determine_where_to_eval_expr(start)?);
-            eval_at = eval_at.max(determine_where_to_eval_expr(end)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs, join_order)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(start, join_order)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(end, join_order)?);
         }
         Expr::Case {
             base,
@@ -614,21 +884,21 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
             else_expr,
         } => {
             if let Some(base) = base {
-                eval_at = eval_at.max(determine_where_to_eval_expr(base)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(base, join_order)?);
             }
             for (when, then) in when_then_pairs {
-                eval_at = eval_at.max(determine_where_to_eval_expr(when)?);
-                eval_at = eval_at.max(determine_where_to_eval_expr(then)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(when, join_order)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(then, join_order)?);
             }
             if let Some(else_expr) = else_expr {
-                eval_at = eval_at.max(determine_where_to_eval_expr(else_expr)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(else_expr, join_order)?);
             }
         }
         Expr::Cast { expr, .. } => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
         }
         Expr::Collate(expr, _) => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
         }
         Expr::DoublyQualified(_, _, _) => {
             unreachable!("DoublyQualified should be resolved to a Column before resolving eval_at")
@@ -638,7 +908,7 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
         }
         Expr::FunctionCall { args, .. } => {
             for arg in args.as_ref().unwrap_or(&vec![]).iter() {
-                eval_at = eval_at.max(determine_where_to_eval_expr(arg)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(arg, join_order)?);
             }
         }
         Expr::FunctionCallStar { .. } => {}
@@ -649,15 +919,15 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
             todo!("in table not supported yet")
         }
         Expr::IsNull(expr) => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
         }
         Expr::Name(_) => {}
         Expr::NotNull(expr) => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
         }
         Expr::Parenthesized(exprs) => {
             for expr in exprs.iter() {
-                eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
             }
         }
         Expr::Raise(_, _) => {
@@ -667,7 +937,7 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
             todo!("subquery not supported yet")
         }
         Expr::Unary(_, expr) => {
-            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr, join_order)?);
         }
         Expr::Variable(_) => {}
     }
@@ -752,19 +1022,17 @@ fn parse_join<'a>(
                 let mut preds = vec![];
                 break_predicate_at_and_boundaries(expr, &mut preds);
                 for predicate in preds.iter_mut() {
-                    bind_column_references(predicate, &scope.tables, None)?;
+                    bind_column_references(predicate, &mut scope.tables, None)?;
                 }
                 for pred in preds {
-                    let cur_table_idx = scope.tables.len() - 1;
-                    let eval_at = if outer {
-                        EvalAt::Loop(cur_table_idx)
-                    } else {
-                        determine_where_to_eval_expr(&pred)?
-                    };
                     out_where_clause.push(WhereTerm {
                         expr: pred,
-                        from_outer_join: outer,
-                        eval_at,
+                        from_outer_join: if outer {
+                            Some(scope.tables.len() - 1)
+                        } else {
+                            None
+                        },
+                        consumed: false,
                     });
                 }
             }
@@ -826,15 +1094,15 @@ fn parse_join<'a>(
                             is_rowid_alias: right_col.is_rowid_alias,
                         }),
                     );
-                    let eval_at = if outer {
-                        EvalAt::Loop(cur_table_idx)
-                    } else {
-                        determine_where_to_eval_expr(&expr)?
-                    };
+
+                    let left_table = scope.tables.get_mut(left_table_idx).unwrap();
+                    left_table.mark_column_used(left_col_idx);
+                    let right_table = scope.tables.get_mut(cur_table_idx).unwrap();
+                    right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
-                        from_outer_join: outer,
-                        eval_at,
+                        from_outer_join: if outer { Some(cur_table_idx) } else { None },
+                        consumed: false,
                     });
                 }
                 using = Some(distinct_names);

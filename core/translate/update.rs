@@ -11,9 +11,11 @@ use limbo_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
 use super::emitter::emit_program;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    Direction, IterationDirection, Plan, ResultSetColumn, TableReference, UpdatePlan,
+    ColumnUsedMask, IterationDirection, Plan, ResultSetColumn, TableReference, UpdatePlan,
 };
-use super::planner::{bind_column_references, parse_limit, parse_where};
+use super::planner::bind_column_references;
+use super::planner::{parse_limit, parse_where};
+use super::schema::ParseSchema;
 
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -49,8 +51,9 @@ pub fn translate_update(
     schema: &Schema,
     body: &mut Update,
     syms: &SymbolTable,
+    parse_schema: ParseSchema,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(schema, body)?;
+    let mut plan = prepare_update_plan(schema, body, parse_schema)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let mut program = ProgramBuilder::new(ProgramBuilderOpts {
@@ -63,36 +66,55 @@ pub fn translate_update(
     Ok(program)
 }
 
-pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<Plan> {
+pub fn prepare_update_plan(
+    schema: &Schema,
+    body: &mut Update,
+    parse_schema: ParseSchema,
+) -> crate::Result<Plan> {
+    if body.with.is_some() {
+        bail_parse_error!("WITH clause is not supported");
+    }
+    if body.or_conflict.is_some() {
+        bail_parse_error!("ON CONFLICT clause is not supported");
+    }
     let table_name = &body.tbl_name.name;
     let table = match schema.get_table(table_name.0.as_str()) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
-    let Some(btree_table) = table.btree() else {
-        bail_parse_error!("Error: {} is not a btree table", table_name);
-    };
-    let iter_dir: Option<IterationDirection> = body.order_by.as_ref().and_then(|order_by| {
-        order_by.first().and_then(|ob| {
-            ob.order.map(|o| match o {
-                SortOrder::Asc => IterationDirection::Forwards,
-                SortOrder::Desc => IterationDirection::Backwards,
+    let iter_dir = body
+        .order_by
+        .as_ref()
+        .and_then(|order_by| {
+            order_by.first().and_then(|ob| {
+                ob.order.map(|o| match o {
+                    SortOrder::Asc => IterationDirection::Forwards,
+                    SortOrder::Desc => IterationDirection::Backwards,
+                })
             })
         })
-    });
-    let table_references = vec![TableReference {
-        table: Table::BTree(btree_table.clone()),
+        .unwrap_or(IterationDirection::Forwards);
+    let mut table_references = vec![TableReference {
+        table: match table.as_ref() {
+            Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
+            Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
+            _ => unreachable!(),
+        },
         identifier: table_name.0.clone(),
-        op: Operation::Scan { iter_dir },
+        op: Operation::Scan {
+            iter_dir,
+            index: None,
+        },
         join_info: None,
+        col_used_mask: ColumnUsedMask::new(),
     }];
     let set_clauses = body
         .sets
         .iter_mut()
         .map(|set| {
             let ident = normalize_ident(set.col_names[0].0.as_str());
-            let col_index = btree_table
-                .columns
+            let col_index = table
+                .columns()
                 .iter()
                 .enumerate()
                 .find_map(|(i, col)| {
@@ -108,7 +130,7 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
                     ))
                 })?;
 
-            let _ = bind_column_references(&mut set.expr, &table_references, None);
+            let _ = bind_column_references(&mut set.expr, &mut table_references, None);
             Ok((col_index, set.expr.clone()))
         })
         .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
@@ -118,7 +140,7 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
     if let Some(returning) = &mut body.returning {
         for rc in returning.iter_mut() {
             if let ResultColumn::Expr(expr, alias) = rc {
-                bind_column_references(expr, &table_references, None)?;
+                bind_column_references(expr, &mut table_references, None)?;
                 result_columns.push(ResultSetColumn {
                     expr: expr.clone(),
                     alias: alias.as_ref().and_then(|a| {
@@ -138,23 +160,13 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
     let order_by = body.order_by.as_ref().map(|order| {
         order
             .iter()
-            .map(|o| {
-                (
-                    o.expr.clone(),
-                    o.order
-                        .map(|s| match s {
-                            SortOrder::Asc => Direction::Ascending,
-                            SortOrder::Desc => Direction::Descending,
-                        })
-                        .unwrap_or(Direction::Ascending),
-                )
-            })
+            .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
             .collect()
     });
     // Parse the WHERE clause
     parse_where(
         body.where_clause.as_ref().map(|w| *w.clone()),
-        &table_references,
+        &mut table_references,
         Some(&result_columns),
         &mut where_clause,
     )?;
@@ -166,6 +178,21 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
         .map(|l| parse_limit(l))
         .unwrap_or(Ok((None, None)))?;
 
+    // Check what indexes will need to be updated by checking set_clauses and see
+    // if a column is contained in an index.
+    let indexes = schema.get_indices(&table_name.0);
+    let indexes_to_update = indexes
+        .iter()
+        .filter(|index| {
+            index.columns.iter().any(|index_column| {
+                set_clauses
+                    .iter()
+                    .any(|(set_index_column, _)| index_column.pos_in_table == *set_index_column)
+            })
+        })
+        .cloned()
+        .collect();
+
     Ok(Plan::Update(UpdatePlan {
         table_references,
         set_clauses,
@@ -175,5 +202,7 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
         limit,
         offset,
         contains_constant_false_condition: false,
+        indexes_to_update,
+        parse_schema,
     }))
 }

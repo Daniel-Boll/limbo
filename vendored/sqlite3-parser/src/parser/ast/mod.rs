@@ -1460,7 +1460,7 @@ bitflags::bitflags! {
 }
 
 /// Sort orders
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SortOrder {
     /// `ASC`
     Asc,
@@ -1622,6 +1622,10 @@ pub enum PragmaName {
     LegacyFileFormat,
     /// Return the total number of pages in the database file.
     PageCount,
+    /// Return the page size of the database in bytes.
+    PageSize,
+    /// Returns schema version of the database file.
+    SchemaVersion,
     /// returns information about the columns of a table
     TableInfo,
     /// Returns the user version of the database file.

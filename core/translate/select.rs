@@ -1,18 +1,22 @@
-use super::emitter::emit_program;
-use super::plan::{select_star, Operation, Search, SelectQueryType};
+use super::emitter::{emit_program, TranslateCtx};
+use super::plan::{
+    select_star, AggDistinctness, JoinOrderMember, Operation, Search, SelectQueryType,
+};
 use super::planner::Scope;
 use crate::function::{AggFunc, ExtFunc, Func};
+use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{Aggregate, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan};
+use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
     parse_where, resolve_aggregates,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+use crate::vdbe::insn::Insn;
 use crate::SymbolTable;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
-use limbo_sqlite3_parser::ast::{self};
+use limbo_sqlite3_parser::ast::{self, SortOrder};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
 
 pub fn translate_select(
@@ -87,6 +91,14 @@ pub fn prepare_select_plan<'a>(
             );
 
             let mut plan = SelectPlan {
+                join_order: table_references
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| JoinOrderMember {
+                        table_no: i,
+                        is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
+                    })
+                    .collect(),
                 table_references,
                 result_columns,
                 where_clause: where_predicates,
@@ -104,12 +116,17 @@ pub fn prepare_select_plan<'a>(
                 match column {
                     ResultColumn::Star => {
                         select_star(&plan.table_references, &mut plan.result_columns);
+                        for table in plan.table_references.iter_mut() {
+                            for idx in 0..table.columns().len() {
+                                table.mark_column_used(idx);
+                            }
+                        }
                     }
                     ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.0.as_str());
                         let referenced_table = plan
                             .table_references
-                            .iter()
+                            .iter_mut()
                             .enumerate()
                             .find(|(_, t)| t.identifier == name_normalized);
 
@@ -117,29 +134,35 @@ pub fn prepare_select_plan<'a>(
                             crate::bail_parse_error!("Table {} not found", name.0);
                         }
                         let (table_index, table) = referenced_table.unwrap();
-                        for (idx, col) in table.columns().iter().enumerate() {
+                        let num_columns = table.columns().len();
+                        for idx in 0..num_columns {
+                            let is_rowid_alias = {
+                                let columns = table.columns();
+                                columns[idx].is_rowid_alias
+                            };
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table_index,
                                     column: idx,
-                                    is_rowid_alias: col.is_rowid_alias,
+                                    is_rowid_alias,
                                 },
                                 alias: None,
                                 contains_aggregates: false,
                             });
+                            table.mark_column_used(idx);
                         }
                     }
                     ResultColumn::Expr(ref mut expr, maybe_alias) => {
                         bind_column_references(
                             expr,
-                            &plan.table_references,
+                            &mut plan.table_references,
                             Some(&plan.result_columns),
                         )?;
                         match expr {
                             ast::Expr::FunctionCall {
                                 name,
-                                distinctness: _,
+                                distinctness,
                                 args,
                                 filter_over: _,
                                 order_by: _,
@@ -149,6 +172,10 @@ pub fn prepare_select_plan<'a>(
                                 } else {
                                     0
                                 };
+                                let distinctness = AggDistinctness::from_ast(distinctness.as_ref());
+                                if distinctness.is_distinct() && args_count != 1 {
+                                    crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
+                                }
                                 match Func::resolve_function(
                                     normalize_ident(name.0.as_str()).as_str(),
                                     args_count,
@@ -172,6 +199,7 @@ pub fn prepare_select_plan<'a>(
                                             func: f,
                                             args: agg_args.clone(),
                                             original_expr: expr.clone(),
+                                            distinctness,
                                         };
                                         aggregate_expressions.push(agg.clone());
                                         plan.result_columns.push(ResultSetColumn {
@@ -185,7 +213,7 @@ pub fn prepare_select_plan<'a>(
                                     }
                                     Ok(_) => {
                                         let contains_aggregates =
-                                            resolve_aggregates(expr, &mut aggregate_expressions);
+                                            resolve_aggregates(expr, &mut aggregate_expressions)?;
                                         plan.result_columns.push(ResultSetColumn {
                                             alias: maybe_alias.as_ref().map(|alias| match alias {
                                                 ast::As::Elided(alias) => alias.0.clone(),
@@ -202,7 +230,7 @@ pub fn prepare_select_plan<'a>(
                                                 let contains_aggregates = resolve_aggregates(
                                                     expr,
                                                     &mut aggregate_expressions,
-                                                );
+                                                )?;
                                                 plan.result_columns.push(ResultSetColumn {
                                                     alias: maybe_alias.as_ref().map(|alias| {
                                                         match alias {
@@ -220,6 +248,7 @@ pub fn prepare_select_plan<'a>(
                                                     func: AggFunc::External(f.func.clone().into()),
                                                     args: args.as_ref().unwrap().clone(),
                                                     original_expr: expr.clone(),
+                                                    distinctness,
                                                 };
                                                 aggregate_expressions.push(agg.clone());
                                                 plan.result_columns.push(ResultSetColumn {
@@ -256,6 +285,7 @@ pub fn prepare_select_plan<'a>(
                                             "1".to_string(),
                                         ))],
                                         original_expr: expr.clone(),
+                                        distinctness: AggDistinctness::NonDistinct,
                                     };
                                     aggregate_expressions.push(agg.clone());
                                     plan.result_columns.push(ResultSetColumn {
@@ -275,7 +305,7 @@ pub fn prepare_select_plan<'a>(
                             }
                             expr => {
                                 let contains_aggregates =
-                                    resolve_aggregates(expr, &mut aggregate_expressions);
+                                    resolve_aggregates(expr, &mut aggregate_expressions)?;
                                 plan.result_columns.push(ResultSetColumn {
                                     alias: maybe_alias.as_ref().map(|alias| match alias {
                                         ast::As::Elided(alias) => alias.0.clone(),
@@ -293,7 +323,7 @@ pub fn prepare_select_plan<'a>(
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
                 where_clause,
-                &plan.table_references,
+                &mut plan.table_references,
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
             )?;
@@ -303,12 +333,13 @@ pub fn prepare_select_plan<'a>(
                     replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
                     bind_column_references(
                         expr,
-                        &plan.table_references,
+                        &mut plan.table_references,
                         Some(&plan.result_columns),
                     )?;
                 }
 
                 plan.group_by = Some(GroupBy {
+                    sort_order: Some((0..group_by.exprs.len()).map(|_| SortOrder::Asc).collect()),
                     exprs: group_by.exprs,
                     having: if let Some(having) = group_by.having {
                         let mut predicates = vec![];
@@ -316,11 +347,11 @@ pub fn prepare_select_plan<'a>(
                         for expr in predicates.iter_mut() {
                             bind_column_references(
                                 expr,
-                                &plan.table_references,
+                                &mut plan.table_references,
                                 Some(&plan.result_columns),
                             )?;
                             let contains_aggregates =
-                                resolve_aggregates(expr, &mut aggregate_expressions);
+                                resolve_aggregates(expr, &mut aggregate_expressions)?;
                             if !contains_aggregates {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
@@ -352,18 +383,12 @@ pub fn prepare_select_plan<'a>(
 
                     bind_column_references(
                         &mut o.expr,
-                        &plan.table_references,
+                        &mut plan.table_references,
                         Some(&plan.result_columns),
                     )?;
-                    resolve_aggregates(&o.expr, &mut plan.aggregates);
+                    resolve_aggregates(&o.expr, &mut plan.aggregates)?;
 
-                    key.push((
-                        o.expr,
-                        o.order.map_or(Direction::Ascending, |o| match o {
-                            ast::SortOrder::Asc => Direction::Ascending,
-                            ast::SortOrder::Desc => Direction::Descending,
-                        }),
-                    ));
+                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
                 }
                 plan.order_by = Some(key);
             }
@@ -411,10 +436,13 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 1,
             Operation::Search(search) => match search {
-                Search::RowidEq { .. } | Search::RowidSearch { .. } => 1,
-                Search::IndexSearch { .. } => 2, // btree cursor and index cursor
-            },
-            Operation::Subquery { plan, .. } => count_plan_required_cursors(plan),
+                Search::RowidEq { .. } => 1,
+                Search::Seek { index, .. } => 1 + index.is_some() as usize,
+            }
+        } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
+            count_plan_required_cursors(&from_clause_subquery.plan)
+        } else {
+            0
         })
         .sum();
     let num_sorter_cursors = plan.group_by.is_some() as usize + plan.order_by.is_some() as usize;
@@ -430,7 +458,10 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
-            Operation::Subquery { plan, .. } => 10 + estimate_num_instructions(plan),
+        } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
+            10 + estimate_num_instructions(&from_clause_subquery.plan)
+        } else {
+            0
         })
         .sum();
 
@@ -456,7 +487,10 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
-            Operation::Subquery { plan, .. } => 3 + estimate_num_labels(plan),
+        } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
+            3 + estimate_num_labels(&from_clause_subquery.plan)
+        } else {
+            0
         })
         .sum::<usize>()
         + 1;
@@ -469,4 +503,42 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
         init_halt_labels + table_labels + group_by_labels + order_by_labels + condition_labels;
 
     num_labels
+}
+
+pub fn emit_simple_count<'a>(
+    program: &mut ProgramBuilder,
+    _t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
+) -> Result<()> {
+    let cursors = plan
+        .table_references
+        .get(0)
+        .unwrap()
+        .resolve_cursors(program)?;
+
+    let cursor_id = {
+        match cursors {
+            (_, Some(cursor_id)) | (Some(cursor_id), None) => cursor_id,
+            _ => panic!("cursor for table should have been opened"),
+        }
+    };
+
+    // TODO: I think this allocation can be avoided if we are smart with the `TranslateCtx`
+    let target_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Count {
+        cursor_id,
+        target_reg,
+        exact: true,
+    });
+
+    program.emit_insn(Insn::Close { cursor_id });
+    let output_reg = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: target_reg,
+        dst_reg: output_reg,
+        amount: 0,
+    });
+    program.emit_result_row(output_reg, 1);
+    Ok(())
 }

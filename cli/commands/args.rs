@@ -4,6 +4,12 @@ use clap_complete::{ArgValueCompleter, CompletionCandidate, PathCompleter};
 use crate::{input::OutputMode, opcodes_dictionary::OPCODE_DESCRIPTIONS};
 
 #[derive(Debug, Clone, Args)]
+pub struct IndexesArgs {
+    /// Name of table
+    pub tbl_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct ExitArgs {
     /// Exit code
     #[arg(default_value_t = 0)]
@@ -105,4 +111,16 @@ pub struct LoadExtensionArgs {
     /// Path to extension file
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     pub path: String,
+}
+
+#[derive(Debug, ValueEnum, Clone)]
+pub enum TimerMode {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TimerArgs {
+    #[arg(value_enum)]
+    pub mode: TimerMode,
 }

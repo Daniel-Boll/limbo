@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
-use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::{self, SortOrder};
 
 use crate::{
     schema::{Column, PseudoTable},
-    types::{OwnedValue, Record},
+    translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -14,9 +14,9 @@ use crate::{
 };
 
 use super::{
-    emitter::TranslateCtx,
+    emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{Direction, ResultSetColumn, SelectPlan},
+    plan::{ResultSetColumn, SelectPlan, TableReference},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -33,21 +33,43 @@ pub struct SortMetadata {
 pub fn init_order_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    order_by: &[(ast::Expr, Direction)],
+    order_by: &[(ast::Expr, SortOrder)],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
     t_ctx.meta_sort = Some(SortMetadata {
         sort_cursor,
         reg_sorter_data: program.alloc_register(),
     });
-    let mut order = Vec::new();
-    for (_, direction) in order_by.iter() {
-        order.push(OwnedValue::Integer(*direction as i64));
-    }
+
+    /*
+     * Terms of the ORDER BY clause that is part of a SELECT statement may be assigned a collating sequence using the COLLATE operator,
+     * in which case the specified collating function is used for sorting.
+     * Otherwise, if the expression sorted by an ORDER BY clause is a column,
+     * then the collating sequence of the column is used to determine sort order.
+     * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
+     */
+    let collations = order_by
+        .iter()
+        .map(|(expr, _)| match expr {
+            ast::Expr::Collate(_, collation_name) => CollationSeq::new(collation_name).map(Some),
+            ast::Expr::Column { table, column, .. } => {
+                let table_reference = referenced_tables.get(*table).unwrap();
+
+                let Some(table_column) = table_reference.table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+
+                Ok(table_column.collation)
+            }
+            _ => Ok(Some(CollationSeq::default())),
+        })
+        .collect::<Result<Vec<_>>>()?;
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
         columns: order_by.len(),
-        order: Record::new(order),
+        order: order_by.iter().map(|(_, direction)| *direction).collect(),
+        collations,
     });
     Ok(())
 }
@@ -77,6 +99,8 @@ pub fn emit_order_by(
             is_rowid_alias: false,
             notnull: false,
             default: None,
+            unique: false,
+            collation: None,
         });
     }
     for i in 0..result_columns.len() {
@@ -95,6 +119,8 @@ pub fn emit_order_by(
             is_rowid_alias: false,
             notnull: false,
             default: None,
+            unique: false,
+            collation: None,
         });
     }
 
@@ -124,9 +150,9 @@ pub fn emit_order_by(
         cursor_id: sort_cursor,
         pc_if_empty: sort_loop_end_label,
     });
+    program.preassign_label_to_next_insn(sort_loop_start_label);
 
-    program.resolve_label(sort_loop_start_label, program.offset());
-    emit_offset(program, t_ctx, plan, sort_loop_next_label)?;
+    emit_offset(program, plan, sort_loop_next_label, t_ctx.reg_offset)?;
 
     program.emit_insn(Insn::SorterData {
         cursor_id: sort_cursor,
@@ -147,15 +173,22 @@ pub fn emit_order_by(
         });
     }
 
-    emit_result_row_and_limit(program, t_ctx, plan, start_reg, Some(sort_loop_end_label))?;
+    emit_result_row_and_limit(
+        program,
+        plan,
+        start_reg,
+        t_ctx.reg_limit,
+        t_ctx.reg_offset,
+        t_ctx.reg_limit_offset_sum,
+        Some(sort_loop_end_label),
+    )?;
 
     program.resolve_label(sort_loop_next_label, program.offset());
     program.emit_insn(Insn::SorterNext {
         cursor_id: sort_cursor,
         pc_if_next: sort_loop_start_label,
     });
-
-    program.resolve_label(sort_loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(sort_loop_end_label);
 
     Ok(())
 }
@@ -163,7 +196,9 @@ pub fn emit_order_by(
 /// Emits the bytecode for inserting a row into an ORDER BY sorter.
 pub fn order_by_sorter_insert(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
+    resolver: &Resolver,
+    sort_metadata: &SortMetadata,
+    res_col_indexes_in_orderby_sorter: &mut Vec<usize>,
     plan: &SelectPlan,
 ) -> Result<()> {
     let order_by = plan.order_by.as_ref().unwrap();
@@ -187,7 +222,7 @@ pub fn order_by_sorter_insert(
             Some(&plan.table_references),
             expr,
             key_reg,
-            &t_ctx.resolver,
+            resolver,
         )?;
     }
     let mut cur_reg = start_reg + order_by_len;
@@ -197,9 +232,7 @@ pub fn order_by_sorter_insert(
             let found = v.iter().find(|(skipped_idx, _)| *skipped_idx == i);
             // If the result column is in the list of columns to skip, we need to know its new index in the ORDER BY sorter.
             if let Some((_, result_column_idx)) = found {
-                t_ctx
-                    .result_column_indexes_in_orderby_sorter
-                    .insert(i, *result_column_idx);
+                res_col_indexes_in_orderby_sorter.insert(i, *result_column_idx);
                 continue;
             }
         }
@@ -208,11 +241,9 @@ pub fn order_by_sorter_insert(
             Some(&plan.table_references),
             &rc.expr,
             cur_reg,
-            &t_ctx.resolver,
+            resolver,
         )?;
-        t_ctx
-            .result_column_indexes_in_orderby_sorter
-            .insert(i, cur_idx_in_orderby_sorter);
+        res_col_indexes_in_orderby_sorter.insert(i, cur_idx_in_orderby_sorter);
         cur_idx_in_orderby_sorter += 1;
         cur_reg += 1;
     }
@@ -220,14 +251,14 @@ pub fn order_by_sorter_insert(
     let SortMetadata {
         sort_cursor,
         reg_sorter_data,
-    } = *t_ctx.meta_sort.as_mut().unwrap();
+    } = sort_metadata;
 
     sorter_insert(
         program,
         start_reg,
         orderby_sorter_column_count,
-        sort_cursor,
-        reg_sorter_data,
+        *sort_cursor,
+        *reg_sorter_data,
     );
     Ok(())
 }
@@ -245,6 +276,7 @@ pub fn sorter_insert(
         start_reg,
         count: column_count,
         dest_reg: record_reg,
+        index_name: None,
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id,
@@ -258,7 +290,7 @@ pub fn sorter_insert(
 ///
 /// If any result columns can be skipped, this returns list of 2-tuples of (SkippedResultColumnIndex: usize, ResultColumnIndexInOrderBySorter: usize)
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(ast::Expr, Direction)],
+    order_by: &[(ast::Expr, SortOrder)],
     result_columns: &[ResultSetColumn],
 ) -> Option<Vec<(usize, usize)>> {
     let mut result_column_remapping: Option<Vec<(usize, usize)>> = None;

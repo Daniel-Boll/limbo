@@ -5,6 +5,7 @@ from time import sleep
 import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
+from cli_tests import console
 
 
 PIPE_BUF = 4096
@@ -26,12 +27,15 @@ class LimboShell:
         self.pipe = self._start_repl(init_commands)
 
     def _start_repl(self, init_commands: Optional[str]) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["RUST_BACKTRACE"] = "1"
         pipe = subprocess.Popen(
             [self.config.sqlite_exec, *self.config.sqlite_flags],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=env,
         )
         if init_commands and pipe.stdin is not None:
             pipe.stdin.write((init_commands + "\n").encode())
@@ -50,7 +54,8 @@ class LimboShell:
             return ""
         self._write_to_pipe(f"SELECT '{end_marker}';")
         output = ""
-        while True:
+        done = False
+        while not done:
             ready, _, errors = select.select(
                 [self.pipe.stdout, self.pipe.stderr],
                 [],
@@ -58,7 +63,7 @@ class LimboShell:
             )
             ready_or_errors = set(ready + errors)
             if self.pipe.stderr in ready_or_errors:
-                self._handle_error()
+                done = self._handle_error()
             if self.pipe.stdout in ready_or_errors:
                 fragment = self.pipe.stdout.read(PIPE_BUF).decode()
                 output += fragment
@@ -73,13 +78,10 @@ class LimboShell:
 
     def _handle_error(self) -> None:
         while True:
-            ready, _, errors = select.select(
-                [self.pipe.stderr], [], [self.pipe.stderr], 0
-            )
-            if not (ready + errors):
-                break
-            error_output = self.pipe.stderr.read(PIPE_BUF).decode()
-            print(error_output, end="")
+            chunk = self.pipe.stderr.read(PIPE_BUF).decode()
+            if not chunk:
+                break  # EOF
+            console.error(chunk, end="", _stack_offset=2)
         raise RuntimeError("Error encountered in Limbo shell.")
 
     @staticmethod
@@ -130,7 +132,7 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
         self.shell.quit()
 
     def run_test(self, name: str, sql: str, expected: str) -> None:
-        print(f"Running test: {name}")
+        console.test(f"Running test: {name}", _stack_offset=2)
         actual = self.shell.execute(sql)
         assert actual == expected, (
             f"Test failed: {name}\n"
@@ -139,18 +141,27 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
             f"Actual:\n{repr(actual)}"
         )
 
-    def debug_print(self, sql: str):
-        print(f"debugging: {sql}")
+    def run_debug(self, sql: str):
+        console.debug(f"debugging: {sql}", _stack_offset=2)
         actual = self.shell.execute(sql)
-        print(f"OUTPUT:\n{repr(actual)}")
+        console.debug(f"OUTPUT:\n{repr(actual)}", _stack_offset=2)
 
     def run_test_fn(
         self, sql: str, validate: Callable[[str], bool], desc: str = ""
     ) -> None:
-        actual = self.shell.execute(sql)
+        # Print the test that is executing before executing the sql command
+        # Printing later confuses the user of the code what test has actually failed
         if desc:
-            print(f"Testing: {desc}")
+            console.test(f"Testing: {desc}", _stack_offset=2)
+        actual = self.shell.execute(sql)
         assert validate(actual), f"Test failed\nSQL: {sql}\nActual:\n{repr(actual)}"
 
     def execute_dot(self, dot_command: str) -> None:
         self.shell._write_to_pipe(dot_command)
+
+    # Enables the use of `with` syntax
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        self.quit()

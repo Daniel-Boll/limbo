@@ -17,11 +17,13 @@ pub enum Error {
     ToSqlConversionFailure(BoxError),
     #[error("Mutex lock error: {0}")]
     MutexError(String),
+    #[error("SQL execution failure: `{0}`")]
+    SqlExecutionFailure(String),
 }
 
 impl From<limbo_core::LimboError> for Error {
-    fn from(_err: limbo_core::LimboError) -> Self {
-        todo!();
+    fn from(err: limbo_core::LimboError) -> Self {
+        Error::SqlExecutionFailure(err.to_string())
     }
 }
 
@@ -121,10 +123,42 @@ impl Connection {
         };
         Ok(statement)
     }
+
+    pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(&Row) -> limbo_core::Result<()>,
+    {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+
+        let rows: Vec<Row> = conn
+            .pragma_query(pragma_name)
+            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
+            .iter()
+            .map(|row| row.iter().collect::<Row>())
+            .collect();
+
+        rows.iter().try_for_each(|row| {
+            f(row).map_err(|e| {
+                Error::SqlExecutionFailure(format!("Error executing user defined function: {}", e))
+            })
+        })?;
+        Ok(())
+    }
 }
 
 pub struct Statement {
     inner: Arc<Mutex<limbo_core::Statement>>,
+}
+
+impl Clone for Statement {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 unsafe impl Send for Statement {}
@@ -151,6 +185,10 @@ impl Statement {
     }
 
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
+        {
+            // Reset the statement before executing
+            self.inner.lock().unwrap().reset();
+        }
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
@@ -188,6 +226,39 @@ impl Statement {
             }
         }
     }
+
+    pub fn columns(&self) -> Vec<Column> {
+        let stmt = self.inner.lock().unwrap();
+
+        let n = stmt.num_columns();
+
+        let mut cols = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let name = stmt.get_column_name(i).into_owned();
+            cols.push(Column {
+                name,
+                decl_type: None, // TODO
+            });
+        }
+
+        cols
+    }
+}
+
+pub struct Column {
+    name: String,
+    decl_type: Option<String>,
+}
+
+impl Column {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn decl_type(&self) -> Option<&str> {
+        self.decl_type.as_deref()
+    }
 }
 
 pub trait IntoValue {
@@ -204,6 +275,14 @@ pub struct Transaction {}
 
 pub struct Rows {
     inner: Arc<Mutex<limbo_core::Statement>>,
+}
+
+impl Clone for Rows {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 unsafe impl Send for Rows {}
@@ -228,8 +307,9 @@ impl Rows {
     }
 }
 
+#[derive(Debug)]
 pub struct Row {
-    values: Vec<limbo_core::OwnedValue>,
+    values: Vec<limbo_core::Value>,
 }
 
 unsafe impl Send for Row {}
@@ -239,11 +319,32 @@ impl Row {
     pub fn get_value(&self, index: usize) -> Result<Value> {
         let value = &self.values[index];
         match value {
-            limbo_core::OwnedValue::Integer(i) => Ok(Value::Integer(*i)),
-            limbo_core::OwnedValue::Null => Ok(Value::Null),
-            limbo_core::OwnedValue::Float(f) => Ok(Value::Real(*f)),
-            limbo_core::OwnedValue::Text(text) => Ok(Value::Text(text.to_string())),
-            limbo_core::OwnedValue::Blob(items) => Ok(Value::Blob(items.to_vec())),
+            limbo_core::Value::Integer(i) => Ok(Value::Integer(*i)),
+            limbo_core::Value::Null => Ok(Value::Null),
+            limbo_core::Value::Float(f) => Ok(Value::Real(*f)),
+            limbo_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
+            limbo_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
         }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.values.len()
+    }
+}
+
+impl<'a> FromIterator<&'a limbo_core::Value> for Row {
+    fn from_iter<T: IntoIterator<Item = &'a limbo_core::Value>>(iter: T) -> Self {
+        let values = iter
+            .into_iter()
+            .map(|v| match v {
+                limbo_core::Value::Integer(i) => limbo_core::Value::Integer(*i),
+                limbo_core::Value::Null => limbo_core::Value::Null,
+                limbo_core::Value::Float(f) => limbo_core::Value::Float(*f),
+                limbo_core::Value::Text(s) => limbo_core::Value::Text(s.clone()),
+                limbo_core::Value::Blob(b) => limbo_core::Value::Blob(b.clone()),
+            })
+            .collect();
+
+        Row { values }
     }
 }

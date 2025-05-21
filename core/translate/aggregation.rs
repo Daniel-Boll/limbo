@@ -2,14 +2,17 @@ use limbo_sqlite3_parser::ast;
 
 use crate::{
     function::AggFunc,
-    vdbe::{builder::ProgramBuilder, insn::Insn},
+    vdbe::{
+        builder::ProgramBuilder,
+        insn::{IdxInsertFlags, Insn},
+    },
     LimboError, Result,
 };
 
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{Aggregate, SelectPlan, TableReference},
+    plan::{AggDistinctness, Aggregate, SelectPlan, TableReference},
     result_row::emit_select_result,
 };
 
@@ -41,9 +44,53 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     // This always emits a ResultRow because currently it can only be used for a single row result
     // Limit is None because we early exit on limit 0 and the max rows here is 1
-    emit_select_result(program, t_ctx, plan, None, None)?;
+    emit_select_result(
+        program,
+        &t_ctx.resolver,
+        plan,
+        None,
+        None,
+        t_ctx.reg_nonagg_emit_once_flag,
+        t_ctx.reg_offset,
+        t_ctx.reg_result_cols_start.unwrap(),
+        t_ctx.reg_limit,
+        t_ctx.reg_limit_offset_sum,
+    )?;
 
     Ok(())
+}
+
+/// Emits the bytecode for handling duplicates in a distinct aggregate.
+/// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
+/// the AggStep that would otherwise accumulate the same value multiple times.
+pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_reg: usize) {
+    let AggDistinctness::Distinct { ctx } = &agg.distinctness else {
+        return;
+    };
+    let distinct_agg_ctx = ctx
+        .as_ref()
+        .expect("distinct aggregate context not populated");
+    let num_regs = 1;
+    program.emit_insn(Insn::Found {
+        cursor_id: distinct_agg_ctx.cursor_id,
+        target_pc: distinct_agg_ctx.label_on_conflict,
+        record_reg: agg_arg_reg,
+        num_regs,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: agg_arg_reg,
+        count: num_regs,
+        dest_reg: record_reg,
+        index_name: Some(distinct_agg_ctx.ephemeral_index_name.to_string()),
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: distinct_agg_ctx.cursor_id,
+        record_reg: record_reg,
+        unpacked_start: None,
+        unpacked_count: None,
+        flags: IdxInsertFlags::new(),
+    });
 }
 
 /// Emits the bytecode for processing an aggregate step.
@@ -66,6 +113,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -83,6 +131,7 @@ pub fn translate_aggregation_step(
                 let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
                 expr_reg
             };
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -121,6 +170,7 @@ pub fn translate_aggregation_step(
             }
 
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             translate_expr(
                 program,
                 Some(referenced_tables),
@@ -145,6 +195,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -160,6 +211,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -179,6 +231,7 @@ pub fn translate_aggregation_step(
             let value_reg = program.alloc_register();
 
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             let _ = translate_expr(
                 program,
                 Some(referenced_tables),
@@ -203,6 +256,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -253,6 +307,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -268,6 +323,7 @@ pub fn translate_aggregation_step(
             let expr = &agg.args[0];
             let expr_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            handle_distinct(program, agg, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -299,6 +355,10 @@ pub fn translate_aggregation_step(
                     expr_reg + i,
                     resolver,
                 )?;
+                // invariant: distinct aggregates are only supported for single-argument functions
+                if argc == 1 {
+                    handle_distinct(program, agg, expr_reg + i);
+                }
             }
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,

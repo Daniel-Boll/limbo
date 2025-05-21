@@ -1,11 +1,17 @@
-use std::num::NonZero;
-
-use super::{
-    cast_text_to_numeric, execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx,
+use std::{
+    num::{NonZero, NonZeroUsize},
+    rc::Rc,
+    sync::Arc,
 };
-use crate::storage::wal::CheckpointMode;
-use crate::types::{OwnedValue, Record};
+
+use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::{
+    schema::{BTreeTable, Index},
+    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    translate::collate::CollationSeq,
+};
 use limbo_macros::Description;
+use limbo_sqlite3_parser::ast::SortOrder;
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
@@ -77,7 +83,7 @@ impl IdxInsertFlags {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum RegisterOrLiteral<T: Copy> {
+pub enum RegisterOrLiteral<T: Copy + std::fmt::Display> {
     Register(usize),
     Literal(T),
 }
@@ -85,6 +91,15 @@ pub enum RegisterOrLiteral<T: Copy> {
 impl From<PageIdx> for RegisterOrLiteral<PageIdx> {
     fn from(value: PageIdx) -> Self {
         RegisterOrLiteral::Literal(value)
+    }
+}
+
+impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Literal(lit) => lit.fmt(f),
+            Self::Register(reg) => reg.fmt(f),
+        }
     }
 }
 
@@ -96,6 +111,12 @@ pub enum Insn {
     },
     /// Write a NULL into register dest. If dest_end is Some, then also write NULL into register dest_end and every register in between dest and dest_end. If dest_end is not set, then only register dest is set to NULL.
     Null {
+        dest: usize,
+        dest_end: Option<usize>,
+    },
+    /// Mark the beginning of a subroutine tha can be entered in-line. This opcode is identical to Null
+    /// it has a different name only to make the byte code easier to read and verify
+    BeginSubrtn {
         dest: usize,
         dest_end: Option<usize>,
     },
@@ -132,6 +153,7 @@ pub enum Insn {
         start_reg_a: usize,
         start_reg_b: usize,
         count: usize,
+        collation: Option<CollationSeq>,
     },
     /// Place the result of rhs bitwise AND lhs in third register.
     BitAnd {
@@ -198,6 +220,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -208,6 +231,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -216,6 +240,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
     Le {
@@ -224,6 +249,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -232,6 +258,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -240,6 +267,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
@@ -256,21 +284,15 @@ pub enum Insn {
         jump_if_null: bool,
     },
     /// Open a cursor for reading.
-    OpenReadAsync {
+    OpenRead {
         cursor_id: CursorID,
         root_page: PageIdx,
     },
 
-    /// Await for the completion of open cursor.
-    OpenReadAwait,
-
     /// Open a cursor for a virtual table.
-    VOpenAsync {
+    VOpen {
         cursor_id: CursorID,
     },
-
-    /// Await for the completion of open cursor for a virtual table.
-    VOpenAwait,
 
     /// Create a new virtual table.
     VCreate {
@@ -285,6 +307,8 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
         arg_count: usize,
         args_reg: usize,
+        idx_str: Option<usize>,
+        idx_num: usize,
     },
 
     /// Read a column from the current row of the virtual table cursor.
@@ -310,6 +334,14 @@ pub enum Insn {
         pc_if_next: BranchOffset,
     },
 
+    /// P4 is the name of a virtual table in database P1. Call the xDestroy method of that table.
+    VDestroy {
+        /// Name of a virtual table being destroyed
+        table_name: String,
+        ///  The database within which this virtual table needs to be destroyed (P1).
+        db: usize,
+    },
+
     /// Open a cursor for a pseudo-table that contains a single row.
     OpenPseudo {
         cursor_id: CursorID,
@@ -318,21 +350,12 @@ pub enum Insn {
     },
 
     /// Rewind the cursor to the beginning of the B-Tree.
-    RewindAsync {
-        cursor_id: CursorID,
-    },
-
-    /// Await for the completion of cursor rewind.
-    RewindAwait {
+    Rewind {
         cursor_id: CursorID,
         pc_if_empty: BranchOffset,
     },
 
-    LastAsync {
-        cursor_id: CursorID,
-    },
-
-    LastAwait {
+    Last {
         cursor_id: CursorID,
         pc_if_empty: BranchOffset,
     },
@@ -344,11 +367,21 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Make a record and write it to destination register.
+    TypeCheck {
+        start_reg: usize, // P1
+        count: usize,     // P2
+        /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
+        /// When P3 is non-zero, no type checking occurs for static generated columns.
+        check_generated: bool, // P3
+        table_reference: Rc<BTreeTable>, // P4
+    },
+
+    // Make a record and write it to destination register.
     MakeRecord {
         start_reg: usize, // P1
         count: usize,     // P2
         dest_reg: usize,  // P3
+        index_name: Option<String>,
     },
 
     /// Emit a row of results.
@@ -358,23 +391,14 @@ pub enum Insn {
     },
 
     /// Advance the cursor to the next row.
-    NextAsync {
-        cursor_id: CursorID,
-    },
-
-    /// Await for the completion of cursor advance.
-    NextAwait {
+    Next {
         cursor_id: CursorID,
         pc_if_next: BranchOffset,
     },
 
-    PrevAsync {
+    Prev {
         cursor_id: CursorID,
-    },
-
-    PrevAwait {
-        cursor_id: CursorID,
-        pc_if_next: BranchOffset,
+        pc_if_prev: BranchOffset,
     },
 
     /// Halt the program.
@@ -427,7 +451,7 @@ pub enum Insn {
         register: usize,
     },
 
-    /// Write a string value into a register.
+    // Write a string value into a register.
     String8 {
         value: String,
         dest: usize,
@@ -441,6 +465,11 @@ pub enum Insn {
 
     /// Read the rowid of the current row.
     RowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+    /// Read the rowid of the current row from an index cursor.
+    IdxRowId {
         cursor_id: CursorID,
         dest: usize,
     },
@@ -488,19 +517,40 @@ pub enum Insn {
     /// P3 + P4 are for the original column values that make up that key in unpacked (pre-serialized) form.
     /// If P5 has the OPFLAG_APPEND bit set, that is a hint to the b-tree layer that this insert is likely to be an append.
     /// OPFLAG_NCHANGE bit set, then the change counter is incremented by this instruction. If the OPFLAG_NCHANGE bit is clear, then the change counter is unchanged
-    IdxInsertAsync {
+    IdxInsert {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
         unpacked_start: Option<usize>, // P3 the index of the first register for the unpacked key
         unpacked_count: Option<u16>, // P4 # of unpacked values in the key in P2
         flags: IdxInsertFlags, // TODO: optimization
     },
-    IdxInsertAwait {
-        cursor_id: CursorID,
-    },
 
     /// The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
     /// If the P1 index entry is greater or equal than the key value then jump to P2. Otherwise fall through to the next instruction.
+    // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
+    // If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
+    // Seek to the first index entry that is less than or equal to the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
+    SeekLE {
+        is_index: bool,
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
+    // If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
+    // Seek to the first index entry that is less than the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
+    SeekLT {
+        is_index: bool,
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
+    // If the P1 index entry is greater or equal than the key value then jump to P2. Otherwise fall through to the next instruction.
     IdxGE {
         cursor_id: CursorID,
         start_reg: usize,
@@ -555,9 +605,10 @@ pub enum Insn {
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID, // P1
-        columns: usize,      // P2
-        order: Record,       // P4. 0 if ASC and 1 if DESC
+        cursor_id: CursorID,                   // P1
+        columns: usize,                        // P2
+        order: Vec<SortOrder>,                 // P4.
+        collations: Vec<Option<CollationSeq>>, // The only reason for using Option<CollationSeq> is so the explain message is the same as in SQLite
     },
 
     /// Insert a row into the sorter.
@@ -608,22 +659,21 @@ pub enum Insn {
         end_offset: BranchOffset,
     },
 
-    InsertAsync {
+    Insert {
         cursor: CursorID,
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
         flag: usize,       // Flags used by insert, for now not used.
+        table_name: String,
     },
 
-    InsertAwait {
-        cursor_id: usize,
-    },
-
-    DeleteAsync {
+    Delete {
         cursor_id: CursorID,
     },
 
-    DeleteAwait {
+    IdxDelete {
+        start_reg: usize,
+        num_regs: usize,
         cursor_id: CursorID,
     },
 
@@ -641,6 +691,18 @@ pub enum Insn {
         reg: usize,
     },
 
+    /// If P4==0 then register P3 holds a blob constructed by [MakeRecord](https://sqlite.org/opcode.html#MakeRecord). If P4>0 then register P3 is the first of P4 registers that form an unpacked record.\
+    ///
+    /// Cursor P1 is on an index btree. If the record identified by P3 and P4 contains any NULL value, jump immediately to P2. If all terms of the record are not-NULL then a check is done to determine if any row in the P1 index btree has a matching key prefix. If there are no matches, jump immediately to P2. If there is a match, fall through and leave the P1 cursor pointing to the matching row.\
+    ///
+    /// This opcode is similar to [NotFound](https://sqlite.org/opcode.html#NotFound) with the exceptions that the branch is always taken if any part of the search key input is NULL.
+    NoConflict {
+        cursor_id: CursorID,     // P1 index cursor
+        target_pc: BranchOffset, // P2 jump target
+        record_reg: usize,
+        num_regs: usize,
+    },
+
     NotExists {
         cursor: CursorID,
         rowid_reg: usize,
@@ -653,12 +715,11 @@ pub enum Insn {
         offset_reg: usize,
     },
 
-    OpenWriteAsync {
+    OpenWrite {
         cursor_id: CursorID,
         root_page: RegisterOrLiteral<PageIdx>,
+        name: String,
     },
-
-    OpenWriteAwait {},
 
     Copy {
         src_reg: usize,
@@ -673,7 +734,7 @@ pub enum Insn {
         /// The root page of the new b-tree (P2).
         root: usize,
         /// Flags (P3).
-        flags: usize,
+        flags: CreateBTreeFlags,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -697,6 +758,12 @@ pub enum Insn {
         //  The name of the table being dropped
         table_name: String,
     },
+    DropIndex {
+        ///  The database within which this index needs to be dropped (P1).
+        db: usize,
+        //  The name of the index being dropped
+        index: Arc<Index>,
+    },
 
     /// Close a cursor.
     Close {
@@ -713,7 +780,7 @@ pub enum Insn {
     },
     ParseSchema {
         db: usize,
-        where_clause: String,
+        where_clause: Option<String>,
     },
 
     /// Place the result of lhs >> rhs in dest register.
@@ -778,6 +845,180 @@ pub enum Insn {
         dest: usize,
         cookie: Cookie,
     },
+    /// Open a new cursor P1 to a transient table.
+    OpenEphemeral {
+        cursor_id: usize,
+        is_table: bool,
+    },
+    /// Works the same as OpenEphemeral, name just distinguishes its use; used for transient indexes in joins.
+    OpenAutoindex {
+        cursor_id: usize,
+    },
+    /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
+    Once {
+        target_pc_when_reentered: BranchOffset,
+    },
+    /// Search for a record in the index cursor.
+    /// If any entry for which the key is a prefix exists, jump to target_pc.
+    /// Otherwise, continue to the next instruction.
+    Found {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        record_reg: usize,
+        num_regs: usize,
+    },
+    /// Search for record in the index cusor, if any entry for which the key is a prefix exists
+    /// is a no-op, otherwise go to target_pc
+    /// Example =>
+    /// For a index key (1,2,3):
+    /// NotFound((1,2,3)) => No-op
+    /// NotFound((1,2)) => No-op
+    /// NotFound((2,2, 1)) => Jump
+    NotFound {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        record_reg: usize,
+        num_regs: usize,
+    },
+    /// Apply affinities to a range of registers. Affinities must have the same size of count
+    Affinity {
+        start_reg: usize,
+        count: NonZeroUsize,
+        affinities: String,
+    },
+
+    /// Store the number of entries (an integer value) in the table or index opened by cursor P1 in register P2.
+    ///
+    /// If P3==0, then an exact count is obtained, which involves visiting every btree page of the table.
+    /// But if P3 is non-zero, an estimate is returned based on the current cursor position.
+    Count {
+        cursor_id: CursorID,
+        target_reg: usize,
+        exact: bool,
+    },
+}
+
+impl Insn {
+    pub fn to_function(&self) -> InsnFunction {
+        match self {
+            Insn::Init { .. } => execute::op_init,
+            Insn::Null { .. } => execute::op_null,
+            Insn::BeginSubrtn { .. } => execute::op_null,
+            Insn::NullRow { .. } => execute::op_null_row,
+            Insn::Add { .. } => execute::op_add,
+            Insn::Subtract { .. } => execute::op_subtract,
+            Insn::Multiply { .. } => execute::op_multiply,
+            Insn::Divide { .. } => execute::op_divide,
+            Insn::DropIndex { .. } => execute::op_drop_index,
+            Insn::Compare { .. } => execute::op_compare,
+            Insn::BitAnd { .. } => execute::op_bit_and,
+            Insn::BitOr { .. } => execute::op_bit_or,
+            Insn::BitNot { .. } => execute::op_bit_not,
+            Insn::Checkpoint { .. } => execute::op_checkpoint,
+            Insn::Remainder { .. } => execute::op_remainder,
+            Insn::Jump { .. } => execute::op_jump,
+            Insn::Move { .. } => execute::op_move,
+            Insn::IfPos { .. } => execute::op_if_pos,
+            Insn::NotNull { .. } => execute::op_not_null,
+            Insn::Eq { .. } => execute::op_eq,
+            Insn::Ne { .. } => execute::op_ne,
+            Insn::Lt { .. } => execute::op_lt,
+            Insn::Le { .. } => execute::op_le,
+            Insn::Gt { .. } => execute::op_gt,
+            Insn::Ge { .. } => execute::op_ge,
+            Insn::If { .. } => execute::op_if,
+            Insn::IfNot { .. } => execute::op_if_not,
+            Insn::OpenRead { .. } => execute::op_open_read,
+            Insn::VOpen { .. } => execute::op_vopen,
+            Insn::VCreate { .. } => execute::op_vcreate,
+            Insn::VFilter { .. } => execute::op_vfilter,
+            Insn::VColumn { .. } => execute::op_vcolumn,
+            Insn::VUpdate { .. } => execute::op_vupdate,
+            Insn::VNext { .. } => execute::op_vnext,
+            Insn::VDestroy { .. } => execute::op_vdestroy,
+
+            Insn::OpenPseudo { .. } => execute::op_open_pseudo,
+            Insn::Rewind { .. } => execute::op_rewind,
+            Insn::Last { .. } => execute::op_last,
+            Insn::Column { .. } => execute::op_column,
+            Insn::TypeCheck { .. } => execute::op_type_check,
+            Insn::MakeRecord { .. } => execute::op_make_record,
+            Insn::ResultRow { .. } => execute::op_result_row,
+            Insn::Next { .. } => execute::op_next,
+            Insn::Prev { .. } => execute::op_prev,
+            Insn::Halt { .. } => execute::op_halt,
+            Insn::Transaction { .. } => execute::op_transaction,
+            Insn::AutoCommit { .. } => execute::op_auto_commit,
+            Insn::Goto { .. } => execute::op_goto,
+            Insn::Gosub { .. } => execute::op_gosub,
+            Insn::Return { .. } => execute::op_return,
+            Insn::Integer { .. } => execute::op_integer,
+            Insn::Real { .. } => execute::op_real,
+            Insn::RealAffinity { .. } => execute::op_real_affinity,
+            Insn::String8 { .. } => execute::op_string8,
+            Insn::Blob { .. } => execute::op_blob,
+            Insn::RowId { .. } => execute::op_row_id,
+            Insn::IdxRowId { .. } => execute::op_idx_row_id,
+            Insn::SeekRowid { .. } => execute::op_seek_rowid,
+            Insn::DeferredSeek { .. } => execute::op_deferred_seek,
+            Insn::SeekGE { .. } => execute::op_seek,
+            Insn::SeekGT { .. } => execute::op_seek,
+            Insn::SeekLE { .. } => execute::op_seek,
+            Insn::SeekLT { .. } => execute::op_seek,
+            Insn::SeekEnd { .. } => execute::op_seek_end,
+            Insn::IdxGE { .. } => execute::op_idx_ge,
+            Insn::IdxGT { .. } => execute::op_idx_gt,
+            Insn::IdxLE { .. } => execute::op_idx_le,
+            Insn::IdxLT { .. } => execute::op_idx_lt,
+            Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
+            Insn::AggStep { .. } => execute::op_agg_step,
+            Insn::AggFinal { .. } => execute::op_agg_final,
+            Insn::SorterOpen { .. } => execute::op_sorter_open,
+            Insn::SorterInsert { .. } => execute::op_sorter_insert,
+            Insn::SorterSort { .. } => execute::op_sorter_sort,
+            Insn::SorterData { .. } => execute::op_sorter_data,
+            Insn::SorterNext { .. } => execute::op_sorter_next,
+            Insn::Function { .. } => execute::op_function,
+            Insn::InitCoroutine { .. } => execute::op_init_coroutine,
+            Insn::EndCoroutine { .. } => execute::op_end_coroutine,
+            Insn::Yield { .. } => execute::op_yield,
+            Insn::Insert { .. } => execute::op_insert,
+            Insn::IdxInsert { .. } => execute::op_idx_insert,
+            Insn::Delete { .. } => execute::op_delete,
+            Insn::NewRowid { .. } => execute::op_new_rowid,
+            Insn::MustBeInt { .. } => execute::op_must_be_int,
+            Insn::SoftNull { .. } => execute::op_soft_null,
+            Insn::NoConflict { .. } => execute::op_no_conflict,
+            Insn::NotExists { .. } => execute::op_not_exists,
+            Insn::OffsetLimit { .. } => execute::op_offset_limit,
+            Insn::OpenWrite { .. } => execute::op_open_write,
+            Insn::Copy { .. } => execute::op_copy,
+            Insn::CreateBtree { .. } => execute::op_create_btree,
+            Insn::Destroy { .. } => execute::op_destroy,
+
+            Insn::DropTable { .. } => execute::op_drop_table,
+            Insn::Close { .. } => execute::op_close,
+            Insn::IsNull { .. } => execute::op_is_null,
+            Insn::ParseSchema { .. } => execute::op_parse_schema,
+            Insn::ShiftRight { .. } => execute::op_shift_right,
+            Insn::ShiftLeft { .. } => execute::op_shift_left,
+            Insn::Variable { .. } => execute::op_variable,
+            Insn::ZeroOrNull { .. } => execute::op_zero_or_null,
+            Insn::Not { .. } => execute::op_not,
+            Insn::Concat { .. } => execute::op_concat,
+            Insn::And { .. } => execute::op_and,
+            Insn::Or { .. } => execute::op_or,
+            Insn::Noop => execute::op_noop,
+            Insn::PageCount { .. } => execute::op_page_count,
+            Insn::ReadCookie { .. } => execute::op_read_cookie,
+            Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
+            Insn::Once { .. } => execute::op_once,
+            Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,
+            Insn::Affinity { .. } => execute::op_affinity,
+            Insn::IdxDelete { .. } => execute::op_idx_delete,
+            Insn::Count { .. } => execute::op_count,
+        }
+    }
 }
 
 // TODO: Add remaining cookies.
@@ -795,1044 +1036,4 @@ pub enum Cookie {
     DatabaseTextEncoding = 5,
     /// The "user version" as read and set by the user_version pragma.
     UserVersion = 6,
-}
-
-pub fn exec_add(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    let result = match (lhs, rhs) {
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
-            let result = lhs.overflowing_add(*rhs);
-            if result.1 {
-                OwnedValue::Float(*lhs as f64 + *rhs as f64)
-            } else {
-                OwnedValue::Integer(result.0)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(lhs + rhs),
-        (OwnedValue::Float(f), OwnedValue::Integer(i))
-        | (OwnedValue::Integer(i), OwnedValue::Float(f)) => OwnedValue::Float(*f + *i as f64),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_add(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_add(&cast_text_to_numeric(text.as_str()), other)
-        }
-        _ => todo!(),
-    };
-    match result {
-        OwnedValue::Float(f) if f.is_nan() => OwnedValue::Null,
-        _ => result,
-    }
-}
-
-pub fn exec_subtract(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    let result = match (lhs, rhs) {
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
-            let result = lhs.overflowing_sub(*rhs);
-            if result.1 {
-                OwnedValue::Float(*lhs as f64 - *rhs as f64)
-            } else {
-                OwnedValue::Integer(result.0)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(lhs - rhs),
-        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => OwnedValue::Float(lhs - *rhs as f64),
-        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(*lhs as f64 - rhs),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_subtract(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) => {
-            exec_subtract(&cast_text_to_numeric(text.as_str()), other)
-        }
-        (other, OwnedValue::Text(text)) => {
-            exec_subtract(other, &cast_text_to_numeric(text.as_str()))
-        }
-        _ => todo!(),
-    };
-    match result {
-        OwnedValue::Float(f) if f.is_nan() => OwnedValue::Null,
-        _ => result,
-    }
-}
-
-pub fn exec_multiply(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    let result = match (lhs, rhs) {
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
-            let result = lhs.overflowing_mul(*rhs);
-            if result.1 {
-                OwnedValue::Float(*lhs as f64 * *rhs as f64)
-            } else {
-                OwnedValue::Integer(result.0)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(lhs * rhs),
-        (OwnedValue::Integer(i), OwnedValue::Float(f))
-        | (OwnedValue::Float(f), OwnedValue::Integer(i)) => OwnedValue::Float(*i as f64 * { *f }),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_multiply(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_multiply(&cast_text_to_numeric(text.as_str()), other)
-        }
-
-        _ => todo!(),
-    };
-    match result {
-        OwnedValue::Float(f) if f.is_nan() => OwnedValue::Null,
-        _ => result,
-    }
-}
-
-pub fn exec_divide(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    let result = match (lhs, rhs) {
-        (_, OwnedValue::Integer(0)) | (_, OwnedValue::Float(0.0)) => OwnedValue::Null,
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
-            let result = lhs.overflowing_div(*rhs);
-            if result.1 {
-                OwnedValue::Float(*lhs as f64 / *rhs as f64)
-            } else {
-                OwnedValue::Integer(result.0)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(lhs / rhs),
-        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => OwnedValue::Float(lhs / *rhs as f64),
-        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(*lhs as f64 / rhs),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_divide(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) => exec_divide(&cast_text_to_numeric(text.as_str()), other),
-        (other, OwnedValue::Text(text)) => exec_divide(other, &cast_text_to_numeric(text.as_str())),
-        _ => todo!(),
-    };
-    match result {
-        OwnedValue::Float(f) if f.is_nan() => OwnedValue::Null,
-        _ => result,
-    }
-}
-
-pub fn exec_bit_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (_, OwnedValue::Integer(0))
-        | (OwnedValue::Integer(0), _)
-        | (_, OwnedValue::Float(0.0))
-        | (OwnedValue::Float(0.0), _) => OwnedValue::Integer(0),
-        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(lh & rh),
-        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(*lh as i64 & *rh as i64)
-        }
-        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(*lh as i64 & rh),
-        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => OwnedValue::Integer(lh & *rh as i64),
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_bit_and(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_bit_and(&cast_text_to_numeric(text.as_str()), other)
-        }
-        _ => todo!(),
-    }
-}
-
-pub fn exec_bit_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(lh | rh),
-        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(*lh as i64 | rh),
-        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => OwnedValue::Integer(lh | *rh as i64),
-        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(*lh as i64 | *rh as i64)
-        }
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_bit_or(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_bit_or(&cast_text_to_numeric(text.as_str()), other)
-        }
-        _ => todo!(),
-    }
-}
-
-pub fn exec_remainder(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, _)
-        | (_, OwnedValue::Null)
-        | (_, OwnedValue::Integer(0))
-        | (_, OwnedValue::Float(0.0)) => OwnedValue::Null,
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
-            if rhs == &0 {
-                OwnedValue::Null
-            } else {
-                OwnedValue::Integer(lhs % rhs)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
-            let rhs_int = *rhs as i64;
-            if rhs_int == 0 {
-                OwnedValue::Null
-            } else {
-                OwnedValue::Float(((*lhs as i64) % rhs_int) as f64)
-            }
-        }
-        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => {
-            if rhs == &0 {
-                OwnedValue::Null
-            } else {
-                OwnedValue::Float(((*lhs as i64) % rhs) as f64)
-            }
-        }
-        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => {
-            let rhs_int = *rhs as i64;
-            if rhs_int == 0 {
-                OwnedValue::Null
-            } else {
-                OwnedValue::Float((lhs % rhs_int) as f64)
-            }
-        }
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_remainder(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_remainder(&cast_text_to_numeric(text.as_str()), other)
-        }
-        other => todo!("remainder not implemented for: {:?} {:?}", lhs, other),
-    }
-}
-
-pub fn exec_bit_not(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Null => OwnedValue::Null,
-        OwnedValue::Integer(i) => OwnedValue::Integer(!i),
-        OwnedValue::Float(f) => OwnedValue::Integer(!(*f as i64)),
-        OwnedValue::Text(text) => exec_bit_not(&cast_text_to_numeric(text.as_str())),
-        _ => todo!(),
-    }
-}
-
-pub fn exec_shift_left(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
-            OwnedValue::Integer(compute_shl(*lh, *rh))
-        }
-        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
-            OwnedValue::Integer(compute_shl(*lh as i64, *rh))
-        }
-        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(compute_shl(*lh, *rh as i64))
-        }
-        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(compute_shl(*lh as i64, *rh as i64))
-        }
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_shift_left(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) => {
-            exec_shift_left(&cast_text_to_numeric(text.as_str()), other)
-        }
-        (other, OwnedValue::Text(text)) => {
-            exec_shift_left(other, &cast_text_to_numeric(text.as_str()))
-        }
-        _ => todo!(),
-    }
-}
-
-fn compute_shl(lhs: i64, rhs: i64) -> i64 {
-    if rhs == 0 {
-        lhs
-    } else if rhs > 0 {
-        // for positive shifts, if it's too large return 0
-        if rhs >= 64 {
-            0
-        } else {
-            lhs << rhs
-        }
-    } else {
-        // for negative shifts, check if it's i64::MIN to avoid overflow on negation
-        if rhs == i64::MIN || rhs <= -64 {
-            if lhs < 0 {
-                -1
-            } else {
-                0
-            }
-        } else {
-            lhs >> (-rhs)
-        }
-    }
-}
-
-pub fn exec_shift_right(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
-            OwnedValue::Integer(compute_shr(*lh, *rh))
-        }
-        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
-            OwnedValue::Integer(compute_shr(*lh as i64, *rh))
-        }
-        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(compute_shr(*lh, *rh as i64))
-        }
-        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
-            OwnedValue::Integer(compute_shr(*lh as i64, *rh as i64))
-        }
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_shift_right(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) => {
-            exec_shift_right(&cast_text_to_numeric(text.as_str()), other)
-        }
-        (other, OwnedValue::Text(text)) => {
-            exec_shift_right(other, &cast_text_to_numeric(text.as_str()))
-        }
-        _ => todo!(),
-    }
-}
-
-// compute binary shift to the right if rhs >= 0 and binary shift to the left - if rhs < 0
-// note, that binary shift to the right is sign-extended
-fn compute_shr(lhs: i64, rhs: i64) -> i64 {
-    if rhs == 0 {
-        lhs
-    } else if rhs > 0 {
-        // for positive right shifts
-        if rhs >= 64 {
-            if lhs < 0 {
-                -1
-            } else {
-                0
-            }
-        } else {
-            lhs >> rhs
-        }
-    } else {
-        // for negative right shifts, check if it's i64::MIN to avoid overflow
-        if rhs == i64::MIN || -rhs >= 64 {
-            0
-        } else {
-            lhs << (-rhs)
-        }
-    }
-}
-
-pub fn exec_boolean_not(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Null => OwnedValue::Null,
-        OwnedValue::Integer(i) => OwnedValue::Integer((*i == 0) as i64),
-        OwnedValue::Float(f) => OwnedValue::Integer((*f == 0.0) as i64),
-        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_numeric(text.as_str())),
-        _ => todo!(),
-    }
-}
-pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Text(lhs_text), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + rhs_text.as_str()))
-        }
-        (OwnedValue::Text(lhs_text), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_int.to_string()))
-        }
-        (OwnedValue::Text(lhs_text), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_float.to_string()))
-        }
-        (OwnedValue::Integer(lhs_int), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + rhs_text.as_str()))
-        }
-        (OwnedValue::Integer(lhs_int), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_int.to_string()))
-        }
-        (OwnedValue::Integer(lhs_int), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_float.to_string()))
-        }
-        (OwnedValue::Float(lhs_float), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + rhs_text.as_str()))
-        }
-        (OwnedValue::Float(lhs_float), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_int.to_string()))
-        }
-        (OwnedValue::Float(lhs_float), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_float.to_string()))
-        }
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
-            todo!("TODO: Handle Blob conversion to String")
-        }
-    }
-}
-
-pub fn exec_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (_, OwnedValue::Integer(0))
-        | (OwnedValue::Integer(0), _)
-        | (_, OwnedValue::Float(0.0))
-        | (OwnedValue::Float(0.0), _) => OwnedValue::Integer(0),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_and(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_and(&cast_text_to_numeric(text.as_str()), other)
-        }
-        _ => OwnedValue::Integer(1),
-    }
-}
-
-pub fn exec_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
-    match (lhs, rhs) {
-        (OwnedValue::Null, OwnedValue::Null)
-        | (OwnedValue::Null, OwnedValue::Float(0.0))
-        | (OwnedValue::Float(0.0), OwnedValue::Null)
-        | (OwnedValue::Null, OwnedValue::Integer(0))
-        | (OwnedValue::Integer(0), OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Float(0.0), OwnedValue::Integer(0))
-        | (OwnedValue::Integer(0), OwnedValue::Float(0.0))
-        | (OwnedValue::Float(0.0), OwnedValue::Float(0.0))
-        | (OwnedValue::Integer(0), OwnedValue::Integer(0)) => OwnedValue::Integer(0),
-        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_or(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
-        ),
-        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_or(&cast_text_to_numeric(text.as_str()), other)
-        }
-        _ => OwnedValue::Integer(1),
-    }
-}
-
-impl Insn {
-    pub fn to_function(&self) -> InsnFunction {
-        match self {
-            Insn::Init { .. } => execute::op_init,
-
-            Insn::Null { .. } => execute::op_null,
-
-            Insn::NullRow { .. } => execute::op_null_row,
-
-            Insn::Add { .. } => execute::op_add,
-
-            Insn::Subtract { .. } => execute::op_subtract,
-
-            Insn::Multiply { .. } => execute::op_multiply,
-
-            Insn::Divide { .. } => execute::op_divide,
-
-            Insn::Compare { .. } => execute::op_compare,
-            Insn::BitAnd { .. } => execute::op_bit_and,
-
-            Insn::BitOr { .. } => execute::op_bit_or,
-
-            Insn::BitNot { .. } => execute::op_bit_not,
-
-            Insn::Checkpoint { .. } => execute::op_checkpoint,
-            Insn::Remainder { .. } => execute::op_remainder,
-
-            Insn::Jump { .. } => execute::op_jump,
-            Insn::Move { .. } => execute::op_move,
-            Insn::IfPos { .. } => execute::op_if_pos,
-            Insn::NotNull { .. } => execute::op_not_null,
-
-            Insn::Eq { .. } => execute::op_eq,
-            Insn::Ne { .. } => execute::op_ne,
-            Insn::Lt { .. } => execute::op_lt,
-            Insn::Le { .. } => execute::op_le,
-            Insn::Gt { .. } => execute::op_gt,
-            Insn::Ge { .. } => execute::op_ge,
-            Insn::If { .. } => execute::op_if,
-            Insn::IfNot { .. } => execute::op_if_not,
-            Insn::OpenReadAsync { .. } => execute::op_open_read_async,
-            Insn::OpenReadAwait => execute::op_open_read_await,
-
-            Insn::VOpenAsync { .. } => execute::op_vopen_async,
-
-            Insn::VOpenAwait => execute::op_vopen_await,
-
-            Insn::VCreate { .. } => execute::op_vcreate,
-            Insn::VFilter { .. } => execute::op_vfilter,
-            Insn::VColumn { .. } => execute::op_vcolumn,
-            Insn::VUpdate { .. } => execute::op_vupdate,
-            Insn::VNext { .. } => execute::op_vnext,
-            Insn::OpenPseudo { .. } => execute::op_open_pseudo,
-            Insn::RewindAsync { .. } => execute::op_rewind_async,
-
-            Insn::RewindAwait { .. } => execute::op_rewind_await,
-            Insn::LastAsync { .. } => execute::op_last_async,
-
-            Insn::LastAwait { .. } => execute::op_last_await,
-            Insn::Column { .. } => execute::op_column,
-            Insn::MakeRecord { .. } => execute::op_make_record,
-            Insn::ResultRow { .. } => execute::op_result_row,
-
-            Insn::NextAsync { .. } => execute::op_next_async,
-
-            Insn::NextAwait { .. } => execute::op_next_await,
-            Insn::PrevAsync { .. } => execute::op_prev_async,
-
-            Insn::PrevAwait { .. } => execute::op_prev_await,
-            Insn::Halt { .. } => execute::op_halt,
-            Insn::Transaction { .. } => execute::op_transaction,
-
-            Insn::AutoCommit { .. } => execute::op_auto_commit,
-            Insn::Goto { .. } => execute::op_goto,
-
-            Insn::Gosub { .. } => execute::op_gosub,
-            Insn::Return { .. } => execute::op_return,
-
-            Insn::Integer { .. } => execute::op_integer,
-
-            Insn::Real { .. } => execute::op_real,
-
-            Insn::RealAffinity { .. } => execute::op_real_affinity,
-
-            Insn::String8 { .. } => execute::op_string8,
-
-            Insn::Blob { .. } => execute::op_blob,
-
-            Insn::RowId { .. } => execute::op_row_id,
-
-            Insn::SeekRowid { .. } => execute::op_seek_rowid,
-            Insn::DeferredSeek { .. } => execute::op_deferred_seek,
-            Insn::SeekGE { .. } => execute::op_seek_ge,
-            Insn::SeekGT { .. } => execute::op_seek_gt,
-            Insn::SeekEnd { .. } => execute::op_seek_end,
-            Insn::IdxGE { .. } => execute::op_idx_ge,
-            Insn::IdxGT { .. } => execute::op_idx_gt,
-            Insn::IdxLE { .. } => execute::op_idx_le,
-            Insn::IdxLT { .. } => execute::op_idx_lt,
-            Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
-
-            Insn::AggStep { .. } => execute::op_agg_step,
-            Insn::AggFinal { .. } => execute::op_agg_final,
-
-            Insn::SorterOpen { .. } => execute::op_sorter_open,
-            Insn::SorterInsert { .. } => execute::op_sorter_insert,
-            Insn::SorterSort { .. } => execute::op_sorter_sort,
-            Insn::SorterData { .. } => execute::op_sorter_data,
-            Insn::SorterNext { .. } => execute::op_sorter_next,
-            Insn::Function { .. } => execute::op_function,
-            Insn::InitCoroutine { .. } => execute::op_init_coroutine,
-            Insn::EndCoroutine { .. } => execute::op_end_coroutine,
-
-            Insn::Yield { .. } => execute::op_yield,
-            Insn::InsertAsync { .. } => execute::op_insert_async,
-            Insn::InsertAwait { .. } => execute::op_insert_await,
-            Insn::IdxInsertAsync { .. } => execute::op_idx_insert_async,
-            Insn::IdxInsertAwait { .. } => execute::op_idx_insert_await,
-            Insn::DeleteAsync { .. } => execute::op_delete_async,
-
-            Insn::DeleteAwait { .. } => execute::op_delete_await,
-
-            Insn::NewRowid { .. } => execute::op_new_rowid,
-            Insn::MustBeInt { .. } => execute::op_must_be_int,
-
-            Insn::SoftNull { .. } => execute::op_soft_null,
-
-            Insn::NotExists { .. } => execute::op_not_exists,
-            Insn::OffsetLimit { .. } => execute::op_offset_limit,
-            Insn::OpenWriteAsync { .. } => execute::op_open_write_async,
-            Insn::OpenWriteAwait { .. } => execute::op_open_write_await,
-
-            Insn::Copy { .. } => execute::op_copy,
-            Insn::CreateBtree { .. } => execute::op_create_btree,
-
-            Insn::Destroy { .. } => execute::op_destroy,
-            Insn::DropTable { .. } => execute::op_drop_table,
-            Insn::Close { .. } => execute::op_close,
-
-            Insn::IsNull { .. } => execute::op_is_null,
-
-            Insn::ParseSchema { .. } => execute::op_parse_schema,
-
-            Insn::ShiftRight { .. } => execute::op_shift_right,
-
-            Insn::ShiftLeft { .. } => execute::op_shift_left,
-
-            Insn::Variable { .. } => execute::op_variable,
-
-            Insn::ZeroOrNull { .. } => execute::op_zero_or_null,
-
-            Insn::Not { .. } => execute::op_not,
-
-            Insn::Concat { .. } => execute::op_concat,
-
-            Insn::And { .. } => execute::op_and,
-
-            Insn::Or { .. } => execute::op_or,
-
-            Insn::Noop => execute::op_noop,
-            Insn::PageCount { .. } => execute::op_page_count,
-
-            Insn::ReadCookie { .. } => execute::op_read_cookie,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        types::{OwnedValue, Text},
-        vdbe::insn::exec_or,
-    };
-
-    use super::exec_add;
-
-    #[test]
-    fn test_exec_add() {
-        let inputs = vec![
-            (OwnedValue::Integer(3), OwnedValue::Integer(1)),
-            (OwnedValue::Float(3.0), OwnedValue::Float(1.0)),
-            (OwnedValue::Float(3.0), OwnedValue::Integer(1)),
-            (OwnedValue::Integer(3), OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Text(Text::from_str("2"))),
-            (OwnedValue::Integer(1), OwnedValue::Null),
-            (OwnedValue::Float(1.0), OwnedValue::Null),
-            (OwnedValue::Text(Text::from_str("1")), OwnedValue::Null),
-            (
-                OwnedValue::Text(Text::from_str("1")),
-                OwnedValue::Text(Text::from_str("3")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Float(3.0),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Integer(3),
-            ),
-            (
-                OwnedValue::Float(1.0),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Integer(1),
-                OwnedValue::Text(Text::from_str("3")),
-            ),
-        ];
-
-        let outputs = [
-            OwnedValue::Integer(4),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(4),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-            OwnedValue::Float(4.0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_add(lhs, rhs),
-                outputs[i],
-                "Wrong ADD for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-
-    use super::exec_subtract;
-
-    #[test]
-    fn test_exec_subtract() {
-        let inputs = vec![
-            (OwnedValue::Integer(3), OwnedValue::Integer(1)),
-            (OwnedValue::Float(3.0), OwnedValue::Float(1.0)),
-            (OwnedValue::Float(3.0), OwnedValue::Integer(1)),
-            (OwnedValue::Integer(3), OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Text(Text::from_str("1"))),
-            (OwnedValue::Integer(1), OwnedValue::Null),
-            (OwnedValue::Float(1.0), OwnedValue::Null),
-            (OwnedValue::Text(Text::from_str("4")), OwnedValue::Null),
-            (
-                OwnedValue::Text(Text::from_str("1")),
-                OwnedValue::Text(Text::from_str("3")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Float(3.0),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("1.0")),
-                OwnedValue::Integer(3),
-            ),
-            (
-                OwnedValue::Float(1.0),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Integer(1),
-                OwnedValue::Text(Text::from_str("3")),
-            ),
-        ];
-
-        let outputs = [
-            OwnedValue::Integer(2),
-            OwnedValue::Float(2.0),
-            OwnedValue::Float(2.0),
-            OwnedValue::Float(2.0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(-2),
-            OwnedValue::Float(-2.0),
-            OwnedValue::Float(-2.0),
-            OwnedValue::Float(-2.0),
-            OwnedValue::Float(-2.0),
-            OwnedValue::Float(-2.0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_subtract(lhs, rhs),
-                outputs[i],
-                "Wrong subtract for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-    use super::exec_multiply;
-
-    #[test]
-    fn test_exec_multiply() {
-        let inputs = vec![
-            (OwnedValue::Integer(3), OwnedValue::Integer(2)),
-            (OwnedValue::Float(3.0), OwnedValue::Float(2.0)),
-            (OwnedValue::Float(3.0), OwnedValue::Integer(2)),
-            (OwnedValue::Integer(3), OwnedValue::Float(2.0)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Text(Text::from_str("1"))),
-            (OwnedValue::Integer(1), OwnedValue::Null),
-            (OwnedValue::Float(1.0), OwnedValue::Null),
-            (OwnedValue::Text(Text::from_str("4")), OwnedValue::Null),
-            (
-                OwnedValue::Text(Text::from_str("2")),
-                OwnedValue::Text(Text::from_str("3")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("2.0")),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("2.0")),
-                OwnedValue::Float(3.0),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("2.0")),
-                OwnedValue::Integer(3),
-            ),
-            (
-                OwnedValue::Float(2.0),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Integer(2),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-        ];
-
-        let outputs = [
-            OwnedValue::Integer(6),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(6),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-            OwnedValue::Float(6.0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_multiply(lhs, rhs),
-                outputs[i],
-                "Wrong multiply for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-    use super::exec_divide;
-
-    #[test]
-    fn test_exec_divide() {
-        let inputs = vec![
-            (OwnedValue::Integer(1), OwnedValue::Integer(0)),
-            (OwnedValue::Float(1.0), OwnedValue::Float(0.0)),
-            (OwnedValue::Integer(i64::MIN), OwnedValue::Integer(-1)),
-            (OwnedValue::Float(6.0), OwnedValue::Float(2.0)),
-            (OwnedValue::Float(6.0), OwnedValue::Integer(2)),
-            (OwnedValue::Integer(6), OwnedValue::Integer(2)),
-            (OwnedValue::Null, OwnedValue::Integer(2)),
-            (OwnedValue::Integer(2), OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Null),
-            (
-                OwnedValue::Text(Text::from_str("6")),
-                OwnedValue::Text(Text::from_str("2")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("6")),
-                OwnedValue::Integer(2),
-            ),
-        ];
-
-        let outputs = [
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Float(9.223372036854776e18),
-            OwnedValue::Float(3.0),
-            OwnedValue::Float(3.0),
-            OwnedValue::Float(3.0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Float(3.0),
-            OwnedValue::Float(3.0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_divide(lhs, rhs),
-                outputs[i],
-                "Wrong divide for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-
-    use super::exec_remainder;
-    #[test]
-    fn test_exec_remainder() {
-        let inputs = vec![
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Float(1.0)),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Text(Text::from_str("1"))),
-            (OwnedValue::Float(1.0), OwnedValue::Null),
-            (OwnedValue::Integer(1), OwnedValue::Null),
-            (OwnedValue::Integer(12), OwnedValue::Integer(0)),
-            (OwnedValue::Float(12.0), OwnedValue::Float(0.0)),
-            (OwnedValue::Float(12.0), OwnedValue::Integer(0)),
-            (OwnedValue::Integer(12), OwnedValue::Float(0.0)),
-            (OwnedValue::Integer(12), OwnedValue::Integer(3)),
-            (OwnedValue::Float(12.0), OwnedValue::Float(3.0)),
-            (OwnedValue::Float(12.0), OwnedValue::Integer(3)),
-            (OwnedValue::Integer(12), OwnedValue::Float(3.0)),
-            (
-                OwnedValue::Text(Text::from_str("12.0")),
-                OwnedValue::Text(Text::from_str("3.0")),
-            ),
-            (
-                OwnedValue::Text(Text::from_str("12.0")),
-                OwnedValue::Float(3.0),
-            ),
-            (
-                OwnedValue::Float(12.0),
-                OwnedValue::Text(Text::from_str("12.0")),
-            ),
-        ];
-        let outputs = vec![
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(0),
-            OwnedValue::Float(0.0),
-            OwnedValue::Float(0.0),
-            OwnedValue::Float(0.0),
-            OwnedValue::Float(0.0),
-            OwnedValue::Float(0.0),
-            OwnedValue::Float(0.0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_remainder(lhs, rhs),
-                outputs[i],
-                "Wrong remainder for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-
-    use super::exec_and;
-
-    #[test]
-    fn test_exec_and() {
-        let inputs = vec![
-            (OwnedValue::Integer(0), OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Float(0.0), OwnedValue::Null),
-            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("string")),
-            ),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-            (
-                OwnedValue::Integer(1),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-        ];
-        let outputs = [
-            OwnedValue::Integer(0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_and(lhs, rhs),
-                outputs[i],
-                "Wrong AND for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-
-    #[test]
-    fn test_exec_or() {
-        let inputs = vec![
-            (OwnedValue::Integer(0), OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Float(0.0), OwnedValue::Null),
-            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
-            (OwnedValue::Float(0.0), OwnedValue::Integer(0)),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("string")),
-            ),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-            (OwnedValue::Integer(0), OwnedValue::Text(Text::from_str(""))),
-        ];
-        let outputs = [
-            OwnedValue::Null,
-            OwnedValue::Integer(1),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_or(lhs, rhs),
-                outputs[i],
-                "Wrong OR for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
 }

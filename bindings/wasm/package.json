@@ -3,7 +3,7 @@
   "collaborators": [
     "the Limbo authors"
   ],
-  "version": "0.0.19-pre.4",
+  "version": "0.0.20",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -12,6 +12,7 @@
   "type": "module",
   "main": "./node/dist/index.cjs",
   "module": "./web/dist/index.js",
+  "types": "./web/dist/index.d.ts",
   "exports": {
     ".": {
       "node": "./node/dist/index.cjs",

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
+use crate::vdbe::insn::CmpInsFlags;
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoTable, Schema},
-    types::Record,
+    storage::pager::CreateBTreeFlags,
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder, QueryMode},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
-    OwnedValue,
 };
 use limbo_sqlite3_parser::ast::{self, Expr, Id, SortOrder, SortedColumn};
 
@@ -54,12 +54,16 @@ pub fn translate_create_index(
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns: columns
             .iter()
-            .map(|c| IndexColumn {
-                name: c.0 .1.name.as_ref().unwrap().clone(),
-                order: c.1,
+            .map(|((pos_in_table, col), order)| IndexColumn {
+                name: col.name.as_ref().unwrap().clone(),
+                order: *order,
+                pos_in_table: *pos_in_table,
+                collation: col.collation,
             })
             .collect(),
         unique: unique_if_not_exists.0,
+        ephemeral: false,
+        has_rowid: tbl.has_rowid,
     });
 
     // Allocate the necessary cursors:
@@ -91,15 +95,15 @@ pub fn translate_create_index(
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: root_page_reg,
-        flags: 2, // index leaf
+        flags: CreateBTreeFlags::new_index(),
     });
 
     // open the sqlite schema table for writing and create a new entry for the index
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
+        name: sqlite_table.name.clone(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
     let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
     emit_schema_entry(
         &mut program,
@@ -112,21 +116,13 @@ pub fn translate_create_index(
     );
 
     // determine the order of the columns in the index for the sorter
-    let order = idx
-        .columns
-        .iter()
-        .map(|c| {
-            OwnedValue::Integer(match c.order {
-                SortOrder::Asc => 0,
-                SortOrder::Desc => 1,
-            })
-        })
-        .collect();
+    let order = idx.columns.iter().map(|c| c.order.clone()).collect();
     // open the sorter and the pseudo table
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sorter_cursor_id,
         columns: columns.len(),
-        order: Record::new(order),
+        order,
+        collations: tbl.column_collations(),
     });
     let content_reg = program.alloc_register();
     program.emit_insn(Insn::OpenPseudo {
@@ -136,23 +132,18 @@ pub fn translate_create_index(
     });
 
     // open the table we are creating the index on for reading
-    program.emit_insn(Insn::OpenReadAsync {
+    program.emit_insn(Insn::OpenRead {
         cursor_id: table_cursor_id,
         root_page: tbl.root_page,
     });
-    program.emit_insn(Insn::OpenReadAwait {});
 
-    program.emit_insn(Insn::RewindAsync {
-        cursor_id: table_cursor_id,
-    });
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
-    program.emit_insn(Insn::RewindAwait {
+    program.emit_insn(Insn::Rewind {
         cursor_id: table_cursor_id,
         pc_if_empty: loop_end_label,
     });
-
-    program.resolve_label(loop_start_label, program.offset());
+    program.preassign_label_to_next_insn(loop_start_label);
 
     // Loop start:
     // Collect index values into start_reg..rowid_reg
@@ -177,28 +168,26 @@ pub fn translate_create_index(
         start_reg,
         count: columns.len() + 1,
         dest_reg: record_reg,
+        index_name: Some(idx_name.clone()),
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id: sorter_cursor_id,
         record_reg,
     });
 
-    program.emit_insn(Insn::NextAsync {
-        cursor_id: table_cursor_id,
-    });
-    program.emit_insn(Insn::NextAwait {
+    program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: loop_start_label,
     });
-    program.resolve_label(loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(loop_end_label);
 
     // Open the index btree we created for writing to insert the
     // newly sorted index records.
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: btree_cursor_id,
         root_page: RegisterOrLiteral::Register(root_page_reg),
+        name: idx_name.clone(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     let sorted_loop_start = program.allocate_label();
     let sorted_loop_end = program.allocate_label();
@@ -208,7 +197,7 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         pc_if_empty: sorted_loop_end,
     });
-    program.resolve_label(sorted_loop_start, program.offset());
+    program.preassign_label_to_next_insn(sorted_loop_start);
     let sorted_record_reg = program.alloc_register();
     program.emit_insn(Insn::SorterData {
         pseudo_cursor: pseudo_cursor_id,
@@ -221,21 +210,18 @@ pub fn translate_create_index(
         cursor_id: btree_cursor_id,
     });
     // insert new index record
-    program.emit_insn(Insn::IdxInsertAsync {
+    program.emit_insn(Insn::IdxInsert {
         cursor_id: btree_cursor_id,
         record_reg: sorted_record_reg,
         unpacked_start: None, // TODO: optimize with these to avoid decoding record twice
         unpacked_count: None,
         flags: IdxInsertFlags::new().use_seek(false),
     });
-    program.emit_insn(Insn::IdxInsertAwait {
-        cursor_id: btree_cursor_id,
-    });
     program.emit_insn(Insn::SorterNext {
         cursor_id: sorter_cursor_id,
         pc_if_next: sorted_loop_start,
     });
-    program.resolve_label(sorted_loop_end, program.offset());
+    program.preassign_label_to_next_insn(sorted_loop_end);
 
     // End of the outer loop
     //
@@ -248,7 +234,7 @@ pub fn translate_create_index(
     let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: parse_schema_where_clause,
+        where_clause: Some(parse_schema_where_clause),
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
@@ -257,7 +243,7 @@ pub fn translate_create_index(
 
     // Epilogue:
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
@@ -272,6 +258,8 @@ fn resolve_sorted_columns<'a>(
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
         let ident = normalize_ident(match &sc.expr {
+            // SQLite supports indexes on arbitrary expressions, but we don't (yet).
+            // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
             Expr::Id(Id(col_name)) | Expr::Name(ast::Name(col_name)) => col_name,
             _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
         });
@@ -316,4 +304,181 @@ fn create_idx_stmt_to_sql(
     }
     sql.push(')');
     sql
+}
+
+pub fn translate_drop_index(
+    mode: QueryMode,
+    idx_name: &str,
+    if_exists: bool,
+    schema: &Schema,
+) -> crate::Result<ProgramBuilder> {
+    let idx_name = normalize_ident(idx_name);
+    let mut program = ProgramBuilder::new(crate::vdbe::builder::ProgramBuilderOpts {
+        query_mode: mode,
+        num_cursors: 5,
+        approx_num_insns: 40,
+        approx_num_labels: 5,
+    });
+
+    // Find the index in Schema
+    let mut maybe_index = None;
+    for val in schema.indexes.values() {
+        if maybe_index.is_some() {
+            break;
+        }
+        for idx in val {
+            if idx.name == idx_name {
+                maybe_index = Some(idx);
+                break;
+            }
+        }
+    }
+
+    // If there's no index if_exist is true,
+    // then return normaly, otherwise show an error.
+    if maybe_index.is_none() {
+        if if_exists {
+            let init_label = program.emit_init();
+            let start_offset = program.offset();
+            program.emit_halt();
+            program.resolve_label(init_label, program.offset());
+            program.emit_transaction(true);
+            program.emit_constant_insns();
+            program.emit_goto(start_offset);
+            return Ok(program);
+        } else {
+            return Err(crate::error::LimboError::InvalidArgument(format!(
+                "No such index: {}",
+                &idx_name
+            )));
+        }
+    }
+
+    // 1. Init
+    // 2. Goto
+    let init_label = program.emit_init();
+    let start_offset = program.offset();
+
+    // According to sqlite should emit Null instruction
+    // but why?
+    let null_reg = program.alloc_register();
+    program.emit_null(null_reg, None);
+
+    // String8; r[3] = 'some idx name'
+    let index_name_reg = program.emit_string8_new_reg(idx_name.to_string());
+    // String8; r[4] = 'index'
+    let index_str_reg = program.emit_string8_new_reg("index".to_string());
+
+    // for r[5]=rowid
+    let row_id_reg = program.alloc_register();
+
+    // We're going to use this cursor to search through sqlite_schema
+    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(
+        Some(SQLITE_TABLEID.to_owned()),
+        CursorType::BTreeTable(sqlite_table.clone()),
+    );
+
+    // Open root=1 iDb=0; sqlite_schema for writing
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
+        name: sqlite_table.name.clone(),
+    });
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.resolve_label(loop_start_label, program.offset());
+
+    // Read sqlite_schema.name into dest_reg
+    let dest_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 1, // sqlite_schema.name
+        dest: dest_reg,
+    });
+
+    // if current column is not index_name then jump to Next
+    // skip if sqlite_schema.name != index_name_reg
+    let next_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: index_name_reg,
+        rhs: dest_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    // read type of table
+    // skip if sqlite_schema.type != 'index' (index_str_reg)
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 0,
+        dest: dest_reg,
+    });
+    // if current column is not index then jump to Next
+    program.emit_insn(Insn::Ne {
+        lhs: index_str_reg,
+        rhs: dest_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: row_id_reg,
+    });
+
+    let label_once_end = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: label_once_end,
+    });
+    program.resolve_label(label_once_end, program.offset());
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+    });
+
+    program.resolve_label(next_label, program.offset());
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+
+    program.resolve_label(loop_end_label, program.offset());
+
+    /* TODO do set cookie for real
+    program.emit_insn(Insn::SetCookie {
+        ...
+    });
+    */
+
+    // Destroy index btree
+    program.emit_insn(Insn::Destroy {
+        root: maybe_index.unwrap().root_page,
+        former_root_reg: 0,
+        is_temp: 0,
+    });
+
+    // Remove from the Schema any mention of the index
+    if let Some(idx) = maybe_index {
+        program.emit_insn(Insn::DropIndex {
+            index: idx.clone(),
+            db: 0,
+        });
+    }
+
+    // Epilogue:
+    program.emit_halt();
+    program.resolve_label(init_label, program.offset());
+    program.emit_transaction(true);
+    program.emit_constant_insns();
+    program.emit_goto(start_offset);
+
+    Ok(program)
 }
